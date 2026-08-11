@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Training outputs
+checkpoints/
+logs/
+lightning_logs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+
+# Data (kept out of the repo; point --data at a local store)
+*.zarr/
+data/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Environments / editors
+.venv/
+.env
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.DS_Store

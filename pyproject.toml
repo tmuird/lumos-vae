@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumos"
+version = "0.1.0"
+description = "Physics-informed VAE for separating Raman signal from fluorescence in photobleaching time series"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch>=2.0",
+    "pytorch-lightning>=2.0",
+    "xarray",
+    "zarr",
+    "scikit-image",
+    "matplotlib",
+]
+
+[project.scripts]
+lumos-train = "lumos.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
