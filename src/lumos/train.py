@@ -318,7 +318,10 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to a processed Zarr store",
     )
-    parser.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    parser.add_argument(
+        "--wandb", action=argparse.BooleanOptionalAction, default=True,
+        help="Log to Weights and Biases (--no-wandb for the CSV logger only)",
+    )
     optional_int = {"n_model_components", "steps_per_epoch"}
     for key, val in DEFAULTS.items():
         if isinstance(val, bool):
