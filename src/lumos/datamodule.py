@@ -12,6 +12,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
 from lumos.dataset import BleachingDataset
+from lumos.sampler import LengthGroupedBatchSampler
 
 # Ground-truth variables loaded for logging only. Absent in real-data stores.
 _GT_VARS = (
@@ -28,11 +29,14 @@ _GT_VARS = (
 class ZarrDataModule(pl.LightningDataModule):
     """Load a processed Zarr store and expose train/val/test dataloaders.
 
-    Training uses the train and test splits (the model is transductive and
-    unsupervised); the val split is held out purely to monitor ``val_recon_loss``
-    for the LR scheduler and early stopping. Normalisation std is computed from
-    the train split only, over the first ``n_times_train`` frames, to avoid
-    leakage from the extrapolation region.
+    Fits on the train and test splits by default and monitors ``val_recon_loss``
+    on val. Fitting is unsupervised, so the test spectra can be used without
+    their targets, which a supervised baseline cannot do; it matches the
+    deployment case where the spectra to be corrected are already in hand.
+    ``transductive=False`` fits on train alone, for a strictly held-out estimate.
+
+    The normalisation std comes from the same spectra the model fits on, over the
+    first ``n_times_train`` frames, so it follows the pool automatically.
 
     Parameters
     ----------
@@ -54,7 +58,7 @@ class ZarrDataModule(pl.LightningDataModule):
         n_times_train: Optional[int] = None,
         normalize: bool = True,
         preload_device=None,
-        semi_supervised: bool = False,
+        transductive: bool = True,
     ):
         super().__init__()
         self.zarr_path = zarr_path
@@ -64,7 +68,7 @@ class ZarrDataModule(pl.LightningDataModule):
         self.n_times_train = n_times_train
         self.normalize = normalize
         self.preload_device = preload_device
-        self.semi_supervised = semi_supervised
+        self.transductive = transductive
 
         self.full_ds = None
         self.val_ds = None
@@ -97,45 +101,58 @@ class ZarrDataModule(pl.LightningDataModule):
 
         min_valid = int(lengths.min())
         if self.n_times_train is not None and self.n_times_train > min_valid:
-            raise ValueError(
-                f"n_times_train ({self.n_times_train}) must be <= shortest spot "
-                f"({min_valid} valid frames)"
+            # Not an error: spots shorter than the window form their own batch
+            # group and train at whatever length they have.
+            print(
+                f"  n_times_train={self.n_times_train} exceeds the shortest spot "
+                f"({min_valid} frames); short spots will batch separately"
             )
 
-        mode_str = (
-            "semi-supervised" if self.semi_supervised else "unsupervised (transductive)"
-        )
         print(
-            f"ZarrDataModule: {len(split_arr)} total samples | mode={mode_str} | "
+            f"ZarrDataModule: {len(split_arr)} total samples | "
             f"n_times_train={self.n_times_train} | min_valid_frames={min_valid}"
         )
 
-        def _make_ds(idx, is_test_mask=None):
+        # Full axes, exposed for model construction. The train data is cropped to
+        # n_times_train, but the model still needs the full time axis to
+        # reconstruct the extrapolation window during validation.
+        self.time_values = time_values
+        self.wavenumbers = wavenumbers
+
+        def _make_ds(idx, crop_T=None):
+            inten = intensities.isel(sample=idx.tolist())
+            tvals = time_values
+            lens = lengths[idx]
+            if crop_T is not None:
+                inten = inten.isel(time=slice(0, crop_T))
+                tvals = time_values[:crop_T]
+                lens = np.minimum(lens, crop_T)
             return BleachingDataset(
-                intensities=intensities.isel(sample=idx.tolist()),
+                intensities=inten,
                 labels=labels[idx],
-                time_values=time_values,
+                time_values=tvals,
                 wavenumbers=wavenumbers,
-                lengths=lengths[idx],
+                lengths=lens,
                 n_times_train=self.n_times_train,
                 normalize=self.normalize,
                 device=self.preload_device,
-                is_test_mask=is_test_mask,
             )
 
-        # Std from train split only, to avoid leakage from val/test.
-        ref_std = _make_ds(train_idx).std
+        # Training pool. Fitting is unsupervised, so including the test spectra
+        # leaks no labels, but it does mean reporting on spectra the model has
+        # seen, which is not comparable to a supervised baseline scored on held
+        # out data. Inductive is therefore the default.
+        fit_idx = np.concatenate([train_idx, test_idx]) if self.transductive else train_idx
+        print(
+            f"  fitting on {len(fit_idx)} spectra "
+            f"({'train+test, transductive' if self.transductive else 'train only'}), "
+            f"{len(val_idx)} val, {len(test_idx)} test"
+        )
+        self.full_ds = _make_ds(fit_idx, crop_T=self.n_times_train)
 
-        # Train on train+test; val is genuinely held out. In semi-supervised mode
-        # test samples are restricted to n_times_train frames in the loss.
-        train_test_idx = np.concatenate([train_idx, test_idx])
-        if self.semi_supervised:
-            is_test_mask = np.zeros(len(train_test_idx), dtype=bool)
-            is_test_mask[len(train_idx):] = True
-            self.full_ds = _make_ds(train_test_idx, is_test_mask=is_test_mask)
-        else:
-            self.full_ds = _make_ds(train_test_idx)
-        self.full_ds.std = ref_std
+        # Std over exactly the spectra the model trains on, so it follows the
+        # split automatically if the training set changes.
+        ref_std = self.full_ds.std
 
         self.val_ds = _make_ds(val_idx)
         self.test_ds = _make_ds(test_idx)
@@ -177,7 +194,17 @@ class ZarrDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
-        return self._loader(self.full_ds, shuffle=True)
+        """Batches are homogeneous in frame count, so each has one window length."""
+        sampler = LengthGroupedBatchSampler(
+            self.full_ds.lengths, self.batch_size, shuffle=True
+        )
+        return DataLoader(
+            self.full_ds,
+            batch_sampler=sampler,
+            num_workers=self.num_workers,
+            persistent_workers=(self.num_workers > 0),
+            prefetch_factor=2 if self.num_workers > 0 else None,
+        )
 
     def val_dataloader(self):
         return self._loader(self.val_ds, shuffle=False)

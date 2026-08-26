@@ -8,7 +8,6 @@ frames. Any ground truth in the store is used only for logging.
 """
 
 import argparse
-import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,8 +27,9 @@ torch.set_float32_matmul_precision("medium")
 DEFAULTS = dict(
     # Model
     basis_mode="mog",
-    latent_dim=128,
-    hidden_dim=512,
+    latent_dim=64,
+    hidden_dim=128,
+    decoder_dim=256,
     physics_model="factored",
     learning_rate=5e-4,
     kl_weight=1.0,
@@ -39,7 +39,21 @@ DEFAULTS = dict(
     raman_lr_multiplier=3.0,
     mog_lr_multiplier=3.0,
     noise_lr_multiplier=10.0,
+    shape_lr_multiplier=10.0,
+    lambda_lr_multiplier=10.0,
     lambda_min=0.001,
+    # Input window length sampled per step. "uniform" spans 1..n_times_train and
+    # lets one model serve any window length. It needs roughly twice the epochs,
+    # since only one step in n sees the full window, but given that budget it
+    # matches a fixed-window model at full length and stays within 0.013 Pearson
+    # down to a single frame. "" fixes the window at n_times_train. An explicit
+    # set such as "2,16" also works; "1,16" is unstable and diverges.
+    t_sampling="uniform",
+    # Encoder conv widths, four layers. This stack is ~90% of the parameters, so
+    # it is the only effective size control. 8,16,32,64 is 0.49M parameters and
+    # matches 64,128,256,512 (4.00M) on every metric measured.
+    conv_channels="8,16,32,64",
+    decay_mode="per_sample",  # "per_sample" | "global" | "global_scaled"
     raman_mode="pseudo_voigt",
     n_raman_peaks=300,
     fwhm_G_init=5.0,
@@ -48,14 +62,22 @@ DEFAULTS = dict(
     n_model_components=16,
     # Data
     n_times_train=16,
-    semi_supervised=False,
+    # Fit on the test spectra as well. The model is unsupervised, so it can use
+    # them where a supervised baseline cannot, and this matches the deployment
+    # case where the spectra to be corrected are in hand. Set False for a
+    # strictly held-out estimate.
+    transductive=True,
     # Trainer
-    max_epochs=15000,
+    max_epochs=2000,
     batch_size=8,
     gradient_clip_val=1.0,
     num_workers=4,
-    early_stopping_patience=200,
-    lr_scheduler_patience=20,
+    # Patience is counted in validation checks, not epochs. One check is
+    # roughly val_check_steps optimiser steps.
+    early_stopping_patience=80,
+    early_stopping_min_delta=1e-4,
+    lr_scheduler_patience=7,
+    lr_schedule="cosine",  # "cosine" | "plateau"
     steps_per_epoch=200,
     val_check_steps=500,
     seed=8,
@@ -113,9 +135,9 @@ def build_datamodule(cfg: dict) -> ZarrDataModule:
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         n_times_train=cfg["n_times_train"],
+        transductive=cfg["transductive"],
         normalize=True,
         preload_device=_preload_device(),
-        semi_supervised=cfg["semi_supervised"],
     )
 
 
@@ -123,21 +145,27 @@ def build_model(cfg: dict, dm: ZarrDataModule) -> VAEModule:
     model_kwargs = dict(
         latent_dim=cfg["latent_dim"],
         hidden_dim=cfg["hidden_dim"],
+        decoder_dim=cfg["decoder_dim"],
         learning_rate=cfg["learning_rate"],
         kl_weight=cfg["kl_weight"],
         basis_mode=cfg["basis_mode"],
         lambda_min=cfg["lambda_min"],
+        decay_mode=cfg["decay_mode"],
         raman_l1_weight=cfg["raman_l1_weight"],
         raman_lr_multiplier=cfg["raman_lr_multiplier"],
         mog_lr_multiplier=cfg["mog_lr_multiplier"],
         noise_lr_multiplier=cfg["noise_lr_multiplier"],
+        shape_lr_multiplier=cfg["shape_lr_multiplier"],
+        lambda_lr_multiplier=cfg["lambda_lr_multiplier"],
         raman_mode=cfg["raman_mode"],
         n_raman_peaks=cfg["n_raman_peaks"],
         fwhm_G_init=cfg["fwhm_G_init"],
         fwhm_G_trainable=cfg["fwhm_G_trainable"],
         lr_scheduler_patience=cfg["lr_scheduler_patience"],
+        lr_schedule=cfg["lr_schedule"],
         polynomial_degree=cfg["polynomial_degree"],
-        semi_supervised=cfg["semi_supervised"],
+        t_sampling=cfg["t_sampling"],
+        conv_channels=cfg["conv_channels"],
     )
     n_model = cfg["n_model_components"] or cfg["n_fluorophores"]
     if cfg["basis_mode"] == "mog":
@@ -174,6 +202,13 @@ def train(cfg: dict):
     batches = min(len(dm.train_dataloader()), steps_per_epoch or 10**9)
     val_every = max(1, round(cfg["val_check_steps"] / max(1, batches)))
 
+    steps_per_val = val_every * batches
+    print(
+        f"Validating every {val_every} epoch(s) ({steps_per_val} steps). "
+        f"Early stop after {cfg['early_stopping_patience'] * steps_per_val} "
+        f"steps without improvement."
+    )
+
     model = build_model(cfg, dm)
     run_name = make_run_name(cfg)
     run_dir = Path("checkpoints") / run_name
@@ -183,10 +218,22 @@ def train(cfg: dict):
         ModelCheckpoint(
             dirpath=str(run_dir),
             filename="{epoch:04d}-{val_recon_loss:.4f}",
-            save_last=True,
+            save_last=False,
             save_top_k=3,
             monitor="val_recon_loss",
             mode="min",
+        ),
+        # Written separately from the top-k callback. With save_last on a
+        # monitored callback, Lightning only refreshes last.ckpt when a top-k
+        # save fires, so it silently freezes at the last improvement and the
+        # final weights are never stored.
+        ModelCheckpoint(
+            dirpath=str(run_dir),
+            filename="last",
+            save_top_k=1,
+            monitor=None,
+            every_n_epochs=val_every,
+            enable_version_counter=False,
         ),
         DecompositionEvalCallback(dm, n_samples=4),
     ]
@@ -195,6 +242,7 @@ def train(cfg: dict):
             EarlyStopping(
                 monitor="val_recon_loss",
                 patience=cfg["early_stopping_patience"],
+                min_delta=cfg["early_stopping_min_delta"],
                 mode="min",
             )
         )
@@ -274,7 +322,11 @@ def _build_parser() -> argparse.ArgumentParser:
     optional_int = {"n_model_components", "steps_per_epoch"}
     for key, val in DEFAULTS.items():
         if isinstance(val, bool):
-            parser.add_argument(f"--{key}", action="store_true", default=val)
+            # BooleanOptionalAction gives --flag and --no-flag. store_true cannot
+            # express the second, so a default of True would be unturnoffable.
+            parser.add_argument(
+                f"--{key}", action=argparse.BooleanOptionalAction, default=val
+            )
         elif key in optional_int:
             parser.add_argument(f"--{key}", type=int, default=val)
         else:

@@ -1,5 +1,4 @@
 import math
-import time
 from enum import Enum
 from typing import Optional
 
@@ -31,6 +30,7 @@ class VAE(nn.Module):
         self,
         latent_dim: int = 32,
         hidden_dim: int = 128,
+        decoder_dim: int = 256,
         n_fluorophores: int = 3,
         n_wavenumbers: int = 1024,
         n_times_train: int = 20,
@@ -46,10 +46,12 @@ class VAE(nn.Module):
         dictionary_bases: Optional[torch.Tensor] = None,
         dynamic_bases: bool = False,
         lambda_min: float = 0.001,
+        decay_mode: str = "per_sample",
         raman_mode: str = "conv",
         n_raman_peaks: int = 50,
         fwhm_G_init: float = 1.0,
         fwhm_G_trainable: bool = True,
+        conv_channels: str = "64,128,256,512",
         **kwargs,
     ):
         super().__init__()
@@ -202,11 +204,22 @@ class VAE(nn.Module):
             coeffs += torch.randn_like(coeffs) * 0.01
             self.log_poly_coeffs = nn.Parameter(coeffs)
 
-        self.encoder = VAEEncoder(self.n_wavenumbers, hidden_dim, latent_dim)
+        self.decay_mode = decay_mode
+        if decay_mode in ("global", "global_scaled"):
+            # One characteristic rate per fluorophore, shared by every sample.
+            self.log_lambda_global = nn.Parameter(
+                torch.linspace(-2.0, 3.0, self.n_fluorophores)
+            )
+
+        if isinstance(conv_channels, str):
+            conv_channels = tuple(int(v) for v in conv_channels.split(","))
+        self.encoder = VAEEncoder(
+            self.n_wavenumbers, hidden_dim, latent_dim, conv_channels=conv_channels,
+        )
 
         self.decoder = ParameterDecoder(
             latent_dim,
-            hidden_dim,
+            decoder_dim,
             self.n_fluorophores,
             self.n_wavenumbers,
             raman_mode=raman_mode,
@@ -255,7 +268,7 @@ class VAE(nn.Module):
         # 2. Extract the global physical parameters
         wn = self.wavenumbers
         wn_min, wn_max = wn.min(), wn.max()
-        x0 = wn_min + (wn_max - wn_min) * self.peak_positions_raw
+        x0 = wn_min + (wn_max - wn_min) * self.peak_positions
         f_L = F.softplus(self.log_fwhm_L) + _FWHM_L_MIN
         f_G = F.softplus(self.log_fwhm_G) + _FWHM_G_MIN
 
@@ -357,6 +370,18 @@ class VAE(nn.Module):
         else:
             raise NotImplementedError(f"basis_mode {self.basis_mode!r} not implemented")
 
+    @property
+    def peak_positions(self):
+        """Peak positions in [0, 1], clamped in the forward pass only.
+
+        The backward pass sees the unclamped parameter, so every peak trains at
+        the same rate wherever it sits. Without the clamp peaks drift outside the
+        spectral range, where their Lorentzian tails act as a broad baseline and
+        compete with the fluorescence bases.
+        """
+        raw = self.peak_positions_raw
+        return raw + (raw.clamp(0.0, 1.0) - raw).detach()
+
     def _get_pseudo_voigt_raman(self, amplitudes):
         """
         Construct a Raman spectrum as a weighted sum of N pseudo-Voigt peaks.
@@ -382,7 +407,7 @@ class VAE(nn.Module):
         wn_max = wn.max()
 
         # Peak positions constrained to [wn_min, wn_max] via sigmoid
-        x0 = wn_min + (wn_max - wn_min) * (self.peak_positions_raw)  # [N_peaks]
+        x0 = wn_min + (wn_max - wn_min) * self.peak_positions  # [N_peaks]
 
         # Lorentzian FWHM per peak (global, shared across all samples).
         f_L = F.softplus(self.log_fwhm_L) + _FWHM_L_MIN  # [N_peaks]
@@ -422,23 +447,8 @@ class VAE(nn.Module):
         # amplitudes [B, N_peaks] x pV [N_peaks, W] -> [B, W]
         return amplitudes @ pV.squeeze(0)  # [B, W]
 
-    def _get_c_fluo(self, bg_coeffs):
-        """Evaluate polynomial baseline over the wavenumber grid.
 
-        bg_coeffs : [B, degree+1]  raw coefficients from decoder (no activation)
-        Returns   : [B, W]         positive permanent baseline (softplus-enforced)
-
-        The polynomial is evaluated in normalised wavenumber space (wn_norm in [-1,1])
-        so coefficient magnitudes are comparable regardless of the actual wn range.
-        Softplus is applied to the full evaluated polynomial, not per-coefficient,
-        so the shape can be non-flat while the total remains positive.
-        """
-        # powers: [degree+1, W] - each row is wn_norm^d
-        powers = torch.stack([self.wn_norm**d for d in range(bg_coeffs.shape[1])])
-        # [B, degree+1] @ [degree+1, W] -> [B, W]
-        return F.softplus(bg_coeffs @ powers)
-
-    def forward(self, x):
+    def forward(self, x, sample=None):
         # x: [B, W, T] - std-normalised signal (may be slightly negative after dark subtraction)
 
         # Derive t_use from actual input length.
@@ -456,16 +466,30 @@ class VAE(nn.Module):
         t_norm = self.t_norm_full[:T]
 
         mu, logvar = self.encoder(x, self.wn_norm, t_norm)
-        if self.training:
-            z = torch.concat(
-                (self.reparameterize(mu, logvar), self.reparameterize(mu, logvar)), 0
-            )
-        else:
-            z = self.reparameterize(mu, logvar)
+        # Sample the posterior during training; use the mean for a
+        # deterministic estimate at inference unless sampling is requested.
+        if sample is None:
+            sample = self.training
+        z = self.reparameterize(mu, logvar) if sample else mu
 
         lambdas_raw, raman_out, abundances_raw = self.decoder(z)
 
-        lambdas = F.softplus(lambdas_raw) + self.lambda_min
+        if self.decay_mode == "global":
+            lambdas = (
+                F.softplus(self.log_lambda_global).unsqueeze(0).expand(z.shape[0], -1)
+                + self.lambda_min
+            )
+        elif self.decay_mode == "global_scaled":
+            # Per-fluorophore characteristic rate, modulated by one shared factor
+            # per spectrum (local intensity and oxygen scale every rate together).
+            # Bounded to [0.1x, 10x]; the measured spread across spectra is ~16x.
+            log_scale = torch.tanh(lambdas_raw.mean(dim=1, keepdim=True)) * math.log(10.0)
+            lambdas = (
+                F.softplus(self.log_lambda_global).unsqueeze(0) * torch.exp(log_scale)
+                + self.lambda_min
+            )
+        else:
+            lambdas = F.softplus(lambdas_raw) + self.lambda_min
 
         if self.raman_mode == "pseudo_voigt":
             # raman_out: [B, N_peaks] raw amplitudes
@@ -479,11 +503,6 @@ class VAE(nn.Module):
         # Scale Raman to physical counts/sec.
         raman_counts = (raman_spectrum * self.dataset_std) / self.frame_duration
 
-        # Generate the permanent non-bleaching baseline (C_fluo)
-        # c_fluo_spectrum = self._get_c_fluo(bg_coeffs)
-        # c_fluo_counts = (c_fluo_spectrum * self.dataset_std) / self.frame_duration
-        c_fluo_counts = torch.zeros_like(raman_counts)
-        # Total static floor = Raman + Permanent Fluorescence
 
         bases_normalised = self.bases  # [F, W]
 
@@ -508,8 +527,7 @@ class VAE(nn.Module):
             lambdas,
             abundances,
             raman_counts,
-            bases,
-            c_fluo_counts,
+            bases_normalised
         )
 
     def physics_forward(
@@ -582,22 +600,28 @@ class VAEEncoder(nn.Module):
     spectral axis to a fixed size of 16 to maintain the flat_dim of 2048.
     """
 
-    def __init__(self, n_wavenumbers, hidden_dim, latent_dim):
+    def __init__(self, n_wavenumbers, hidden_dim, latent_dim,
+                 conv_channels=(64, 128, 256, 512)):
         super().__init__()
+        self.conv_channels = tuple(conv_channels)
 
-        self.conv_net = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=(7, 3), stride=(2, 1), padding=(3, 1)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, kernel_size=(7, 3), stride=(2, 1), padding=(3, 1)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, kernel_size=(5, 3), stride=(2, 1), padding=(2, 1)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(256, 512, kernel_size=(5, 3), stride=(2, 1), padding=(2, 1)),
-            nn.LeakyReLU(0.2),
-        )
+        # Four layers, stride 2 on the spectral axis and 1 on time, so W is
+        # reduced 16-fold and T is preserved. Widths are configurable because
+        # this stack holds around 90% of the model's parameters, while the
+        # latent, hidden and decoder sizes together hold about 1%.
+        kernels = [(7, 3), (7, 3), (5, 3), (5, 3)]
+        paddings = [(3, 1), (3, 1), (2, 1), (2, 1)]
+        layers, in_channels = [], 3
+        for out_channels, kernel, padding in zip(self.conv_channels, kernels, paddings):
+            layers += [
+                nn.Conv2d(in_channels, out_channels, kernel_size=kernel,
+                          stride=(2, 1), padding=padding),
+                nn.LeakyReLU(0.2),
+            ]
+            in_channels = out_channels
+        self.conv_net = nn.Sequential(*layers)
 
-        # 128 channels * 16 spatial bins * 1 temporal bin = 2048
-        flat_dim = 512 * 16 * 1
+        flat_dim = self.conv_channels[-1] * 16
 
         self.fc_net = nn.Sequential(nn.Linear(flat_dim, hidden_dim), nn.LeakyReLU(0.2))
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
@@ -617,8 +641,9 @@ class VAEEncoder(nn.Module):
         """
         B, W, T = x.shape
 
-        x_enc = x
-        # x_enc = x
+        # Compressed so the encoder is not dominated by the bright, slowly
+        # varying fluorescence background.
+        x_enc = torch.log1p(F.relu(x))
 
         x_2d = x_enc.unsqueeze(1)  # [B, 1, W, T]
         wn_pe = wn_norm.view(1, 1, W, 1).expand(B, 1, W, T)  # [B, 1, W, T]
@@ -635,13 +660,16 @@ class VAEEncoder(nn.Module):
         # Forces the spatial dimension to exactly 16 bins.
         # Averages the entire temporal dimension T down to exactly 1 bin.
         # This makes the output strictly length-invariant.
-        h = F.adaptive_avg_pool2d(h, output_size=(16, 1))  # [B, 128, 16, 1]
+        # Collapses any number of frames to one bin, so the encoder accepts any
+        # window length. Adding a standard deviation here was measured to make no
+        # difference once runs were trained to convergence.
+        h = F.adaptive_avg_pool2d(h, output_size=(16, 1))
 
         h = h.flatten(1)  # [B, 2048]
         h = self.fc_net(h)
 
         mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h).clamp(-10)
+        logvar = self.fc_logvar(h)
         return mu, logvar
 
 
@@ -649,7 +677,7 @@ class ParameterDecoder(nn.Module):
     def __init__(
         self,
         latent_dim,
-        hidden_dim,
+        decoder_dim,
         n_fluorophores,
         n_wavenumbers,
         raman_mode: str = "conv",
@@ -662,32 +690,32 @@ class ParameterDecoder(nn.Module):
         self.poly_degree = poly_degree
 
         self.trunk_shared = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, decoder_dim),
             nn.LeakyReLU(0.2),
         )
         self.trunk_lambda = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(decoder_dim, decoder_dim),
             nn.LeakyReLU(0.2),
         )
         self.trunk_abundance = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(decoder_dim, decoder_dim),
             nn.LeakyReLU(0.2),
         )
         self.trunk_raman = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(decoder_dim, decoder_dim),
             nn.LeakyReLU(0.2),
         )
 
-        self.head_lambda = nn.Linear(512, n_fluorophores)
-        self.head_abundance = nn.Linear(512, n_fluorophores)
+        self.head_lambda = nn.Linear(decoder_dim, n_fluorophores)
+        self.head_abundance = nn.Linear(decoder_dim, n_fluorophores)
 
         if raman_mode == "pseudo_voigt":
             # Amplitude head: one positive scalar per peak [B, N_peaks].
-            self.head_raman_amplitudes = nn.Linear(512, n_raman_peaks)
+            self.head_raman_amplitudes = nn.Linear(decoder_dim, n_raman_peaks)
         else:
             n_basis = min(64, n_wavenumbers)
             self.head_raman = nn.Sequential(
-                nn.Linear(512, n_basis),
+                nn.Linear(decoder_dim, n_basis),
                 nn.LeakyReLU(0.2),
                 nn.Linear(n_basis, n_wavenumbers),
             )

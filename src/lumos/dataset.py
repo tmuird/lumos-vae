@@ -16,21 +16,19 @@ class BleachingDataset(Dataset):
         dictionary_bases=None,
         lengths=None,
         device=None,
-        is_test_mask=None,
     ):
         """
         Args:
             intensities (np.array): Shape [N_Samples, Time, Wavenumbers]
             labels (list/array): Optional labels (e.g. 'GFP', 'RFP')
-            normalize (bool): Whether to normalise the data by its standard deviation (no mean subtraction - physics output is non-negative)
+            normalize (bool): Divide by the standard deviation. No mean is
+                subtracted, since the physics output is non-negative.
             n_times_train (int): Number of training timepoints (compute stats only from these)
             dictionary_bases (np.ndarray): Optional [D, W] dictionary for dictionary mode
         """
         self.labels = labels
         self.n_times_train = n_times_train
         self.time_values = time_values
-        # Optional boolean mask [N] for semi-supervised mode; True = test sample
-        self.is_test_mask = is_test_mask
         self.wavenumbers = wavenumbers
         self.fluorophore_bases_gt = initial_bases
         self.dictionary_bases = dictionary_bases
@@ -98,14 +96,6 @@ class BleachingDataset(Dataset):
         )
         valid_length_tensor = torch.tensor(valid_length, dtype=torch.long)
 
-        if self.is_test_mask is not None:
-            return (
-                sample,
-                label,
-                valid_length_tensor,
-                torch.tensor(bool(self.is_test_mask[idx]), dtype=torch.bool),
-            )
-
         return sample, label, valid_length_tensor
 
     def get_full(self, idx) -> torch.Tensor:
@@ -159,25 +149,5 @@ class BleachingDataset(Dataset):
             for i in indices
         ]
 
-        if self.is_test_mask is not None:
-            flags = [
-                torch.tensor(bool(self.is_test_mask[i]), dtype=torch.bool)
-                for i in indices
-            ]
-            return list(zip(batch, labels, valid_lengths, flags))
-
         return list(zip(batch, labels, valid_lengths))
 
-    def denormalize(self, normalized_data):
-        """
-        Convert normalized data back to original physical scale.
-
-        Args:
-            normalized_data: Tensor of normalized intensities [..., W, T]
-
-        Returns:
-            Data in original scale
-        """
-        if self.normalize:
-            return normalized_data * self.std
-        return normalized_data

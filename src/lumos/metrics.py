@@ -13,7 +13,6 @@ from scipy.signal import savgol_filter, find_peaks
 from scipy.optimize import linear_sum_assignment
 from skimage.metrics import peak_signal_noise_ratio, normalized_root_mse
 from sklearn.metrics import mean_squared_error, auc
-from pybaselines import whittaker, polynomial
 
 # -- SI-PSNR helpers -----------------------------------------------------------
 

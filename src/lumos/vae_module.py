@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 from torch.nn import functional as F
-from lumos.vae import VAE
+from lumos.vae import VAE, _FWHM_G_MIN, _FWHM_L_MIN
 
 
 class VAEModule(pl.LightningModule):
@@ -21,16 +21,20 @@ class VAEModule(pl.LightningModule):
         dataset_mean: float = 0.0,
         latent_dim: int = 32,
         hidden_dim: int = 128,
+        decoder_dim: int = 256,
         learning_rate: float = 1e-3,
         kl_weight: float = 1,
         raman_l1_weight: float = 0.0,
         noise_alpha_gt: float = 0.0,
         noise_beta_gt: float = 0.0,
+        t_sampling: str = "",
         raman_lr_multiplier: float = 1.0,
         mog_lr_multiplier: float = 3.0,
         noise_lr_multiplier: float = 10.0,
+        shape_lr_multiplier: float = 10.0,
+        lambda_lr_multiplier: float = 10.0,
         lr_scheduler_patience: int = 50,
-        semi_supervised: bool = False,
+        lr_schedule: str = "plateau",
         **model_kwargs,
     ):
         super().__init__()
@@ -38,6 +42,11 @@ class VAEModule(pl.LightningModule):
 
         self.log_alpha = nn.Parameter(torch.tensor(-4.0))
         self.log_beta = nn.Parameter(torch.tensor(-6.0))
+
+        spec = (t_sampling or "").strip()
+        self._t_choices = (
+            [int(v) for v in spec.split(",")] if spec and spec != "uniform" else None
+        )
         self._mog_means_grad_norm: Optional[float] = None
 
         if n_full_timepoints is None:
@@ -61,6 +70,7 @@ class VAEModule(pl.LightningModule):
             dataset_std=dataset_std,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
+            decoder_dim=decoder_dim,
             **model_kwargs,
         )
 
@@ -82,7 +92,14 @@ class VAEModule(pl.LightningModule):
         ds = backing_ds if not hasattr(backing_ds, "dataset") else backing_ds.dataset
         std = float(ds.std) if getattr(ds, "normalize", False) else 1.0
 
-        time_vals = torch.tensor(ds.time_values).float()
+        # Full time axis for the model. The training data may be cropped to
+        # n_times_train, but reconstructing the extrapolation window needs the
+        # full axis, which the datamodule exposes directly.
+        full_time = getattr(datamodule, "time_values", None)
+        if full_time is not None:
+            time_vals = torch.as_tensor(full_time, dtype=torch.float32)
+        else:
+            time_vals = torch.tensor(ds.time_values).float()
         wavs = (
             torch.tensor(ds.wavenumbers).float()
             if getattr(ds, "wavenumbers", None) is not None
@@ -180,12 +197,23 @@ class VAEModule(pl.LightningModule):
 
         mog_param_ids = {id(p) for p in mog_mean_params | mog_scale_params}
 
+        # Global rates, if present, train as their own group.
+        lambda_params = set()
+        if hasattr(self.model, "log_lambda_global"):
+            lambda_params = {self.model.log_lambda_global}
+        lambda_param_ids = {id(p) for p in lambda_params}
+
+        # Global shape parameters get their own learning rate. Left in the base
+        # group they receive too little gradient to move from initialisation.
+        shape_params = [p for p in global_shape_params if p.requires_grad]
+
         base_params = [
             p
             for p in self.model.parameters()
-            if id(p) not in raman_param_ids and id(p) not in mog_param_ids
+            if id(p) not in raman_param_ids
+            and id(p) not in mog_param_ids
+            and id(p) not in lambda_param_ids
         ]
-        base_params += [p for p in global_shape_params if p.requires_grad]
 
         param_groups = [
             {"params": base_params},
@@ -198,6 +226,22 @@ class VAEModule(pl.LightningModule):
                 "lr": self.hparams.learning_rate * self.hparams.raman_lr_multiplier,
             },
         ]
+
+        if shape_params:
+            param_groups.append(
+                {
+                    "params": shape_params,
+                    "lr": self.hparams.learning_rate * self.hparams.shape_lr_multiplier,
+                }
+            )
+        if lambda_params:
+            param_groups.append(
+                {
+                    "params": list(lambda_params),
+                    "lr": self.hparams.learning_rate
+                    * self.hparams.lambda_lr_multiplier,
+                }
+            )
 
         if mog_mean_params:
             param_groups.append(
@@ -221,6 +265,21 @@ class VAEModule(pl.LightningModule):
             lr=self.hparams.learning_rate,
             weight_decay=1e-4,
         )
+        if self.hparams.lr_schedule == "cosine":
+            # Anneals on a fixed trajectory, so two runs are comparable. Plateau
+            # keys off val_recon_loss, which does not track reconstruction
+            # quality here, and its patience counts validation checks rather
+            # than epochs, so it can fail to anneal at all within a run.
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.trainer.max_epochs,
+                eta_min=self.hparams.learning_rate * 1e-3,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            }
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
@@ -239,70 +298,59 @@ class VAEModule(pl.LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
-        time_slice = self.hparams.n_times_train
-
-        # Safely unpack based on the dataset output
-        if len(batch) == 4:
-            x_full, _, lengths, is_test = batch
-        elif len(batch) == 3:
-            x_full, _, lengths = batch
-            is_test = None
+        if len(batch) >= 3:
+            x_full, _, lengths, *_ = batch
         else:
             x_full, _ = batch[:2]
             lengths = torch.full(
                 (x_full.shape[0],), x_full.shape[-1], device=x_full.device
             )
-            is_test = None
 
         B, W, T_max = x_full.shape
+
+        # Batches are homogeneous in frame count, so one window length serves the
+        # whole batch. The ceiling is whatever this batch actually has, which
+        # lets a store mix a long photobleaching series with short acquisitions.
+        # The encoder pools over time, so a model trained at a single length
+        # fails at any other; sampling the length covers the range.
+        limit = min(self.hparams.n_times_train, int(lengths.min()))
+        if self._t_choices is not None:
+            usable = [t for t in self._t_choices if t <= limit] or [limit]
+            time_slice = usable[int(torch.randint(len(usable), (1,)).item())]
+        elif self.hparams.t_sampling == "uniform":
+            time_slice = int(torch.randint(1, limit + 1, (1,)).item())
+        else:
+            time_slice = limit
 
         # Encoder always sees ONLY the first n_times_train frames.
         x_input = x_full[:, :, :time_slice]
 
-        x_recon, mu, logvar, lambdas, abundances, raman, bases, c_fluo_counts = (
+        x_recon, mu, logvar, lambdas, abundances, raman, bases = (
             self.model(x_input)
         )
 
-        if torch.isnan(raman).any() or torch.isnan(x_recon).any():
+        # Report which tensor degraded first, so a NaN identifies its own source
+        # rather than needing to be reproduced.
+        tensors = {
+            "mu": mu, "logvar": logvar, "lambdas": lambdas,
+            "abundances": abundances, "raman": raman, "x_recon": x_recon,
+        }
+        bad = [k for k, v in tensors.items() if not torch.isfinite(v).all()]
+        if bad:
+            summary = "  ".join(
+                f"{k}: absmax={v.abs().max().item():.3e}"
+                for k, v in tensors.items()
+                if torch.isfinite(v).all()
+            )
             raise RuntimeError(
-                f"NaN detected in model outputs at epoch={self.current_epoch} "
-                f"batch={batch_idx}. Check input data and encoder."
+                f"Non-finite values in {bad} at epoch={self.current_epoch} "
+                f"batch={batch_idx}. Finite tensors: {summary}"
             )
 
-        # # validity and semi-supervised masks
-        # if self.hparams.semi_supervised and T_max > time_slice:
-        #     T_target = T_max
-        #     x_recon_phys, _ = self.model.physics_forward(
-        #         lambdas,
-        #         abundances,
-        #         raman + c_fluo_counts,
-        #         self.model.bases,
-        #         time_values=self.t_full[:T_target],
-        #     )
-        #     x_recon_norm = x_recon_phys / self.model.dataset_std
-        #     x_target = x_full
-        # else:
-        T_target = time_slice
         x_target = x_input
         x_recon_norm = x_recon[: x_target.shape[0], :, :time_slice]
 
-        # 1. Base Mask: True if frame < true sample length (ignores zero-padding)
-        t_idx = torch.arange(T_target, device=x_full.device).view(1, 1, -1)
-        lengths_view = lengths.view(-1, 1, 1)
-        # final_mask = t_idx < lengths_view
-
-        # # 2. Semi-Supervised Mask: Test samples ignore frames beyond `time_slice`
-        # if self.hparams.semi_supervised and is_test is not None:
-        #     test_mask = is_test.view(-1, 1, 1)
-        #     extrap_window = t_idx >= time_slice
-        #     # Force test samples to False during the extrapolation window
-        #     final_mask = final_mask & ~(test_mask & extrap_window)
-
-        # final_mask = final_mask.float().expand(-1, W, -1)
-        # mask_sum = final_mask.sum().clamp(min=1.0)
-        # print(f"Final Mask Shape:  {final_mask.shape}")
-
-        # Per-element means so losses are independent of batch/spectrum/time size.
+          # Per-element means so losses are independent of batch/spectrum/time size.
         n_elements = x_input.shape[0] * x_input.shape[1] * x_input.shape[2]
         mse = F.mse_loss(x_recon_norm, x_target, reduction="none").sum() / n_elements
 
@@ -353,8 +401,8 @@ class VAEModule(pl.LightningModule):
             self.log("recon_mse", mse, prog_bar=False)
 
             if hasattr(self.model, "log_fwhm_L"):
-                f_L = F.softplus(self.model.log_fwhm_L) + 5.0
-                f_G = F.softplus(self.model.log_fwhm_G) + 1.0
+                f_L = F.softplus(self.model.log_fwhm_L) + _FWHM_L_MIN
+                f_G = F.softplus(self.model.log_fwhm_G) + _FWHM_G_MIN
                 self.log("fwhm_G", f_G.detach(), prog_bar=True)
                 self.log("fwhm_L_mean", f_L.mean().detach(), prog_bar=True)
                 self.log("fwhm_L_min", f_L.min().detach(), prog_bar=False)
@@ -393,37 +441,14 @@ class VAEModule(pl.LightningModule):
         # Encoder always sees only the first n_times_train frames.
         x_input = x_full[:, :, :time_slice]
 
-        x_recon, mu, logvar, lambdas, abundances, raman, bases, c_fluo_counts = (
+        x_recon, mu, logvar, lambdas, abundances, raman, bases = (
             self.model(x_input)
         )
         # raman_1, raman_2 = raman[: raman.shape[0] // 2], raman[raman.shape[0] // 2 :]
 
-        # In semi-supervised mode val samples are all non-test, so they get
-        # the full time series as reconstruction target (same as training_step
-        # does for non-test samples). This keeps val_recon_loss comparable to
-        # the training loss and gives the LR scheduler a meaningful signal.
         n_valid_full = min(T_max, self.t_full.shape[0])
-        if self.hparams.semi_supervised and n_valid_full > time_slice:
-            x_recon_phys_full, _ = self.model.physics_forward(
-                lambdas,
-                abundances,
-                raman + c_fluo_counts,
-                self.model.bases,
-                time_values=self.t_full[:n_valid_full],
-            )
-            x_recon_norm = x_recon_phys_full / self.model.dataset_std
-            x_target = x_full[:, :, :n_valid_full]
-            T_target = n_valid_full
-        else:
-
-            x_target = x_input
-            x_recon_norm = x_recon[: x_target.shape[0]]  # already [B, W, time_slice]
-            T_target = time_slice
-
-        # Mask to ignore zero-padding (lengths may exceed T_target on padded samples)
-        t_idx = torch.arange(T_target, device=x_full.device).view(1, 1, -1)
-        # valid_mask = (t_idx < lengths.view(-1, 1, 1)).float().expand(-1, W, -1)
-        # mask_sum = valid_mask.sum().clamp(min=1.0)
+        x_target = x_input
+        x_recon_norm = x_recon[: x_target.shape[0]]  # already [B, W, time_slice]
 
         n_elements = x_input.shape[0] * x_input.shape[1] * x_input.shape[2]
         mse = F.mse_loss(x_recon_norm, x_target, reduction="none").sum() / n_elements
@@ -449,18 +474,14 @@ class VAEModule(pl.LightningModule):
         # Reuse x_recon_norm if the full reconstruction was already computed,
         # otherwise run physics_forward over the full window now.
         if time_slice < n_valid_full:
-            if not (self.hparams.semi_supervised):
-                # Full reconstruction not yet computed; run it now for monitoring.
-                x_recon_phys_full, _ = self.model.physics_forward(
-                    lambdas,
-                    abundances,
-                    raman + c_fluo_counts,
-                    self.model.bases,
-                    time_values=self.t_full[:n_valid_full],
-                )
-                x_recon_full = x_recon_phys_full / self.model.dataset_std
-            else:
-                x_recon_full = x_recon_norm  # already covers [0, n_valid_full)
+            x_recon_phys_full, _ = self.model.physics_forward(
+                lambdas,
+                abundances,
+                raman,
+                self.model.bases,
+                time_values=self.t_full[:n_valid_full],
+            )
+            x_recon_full = x_recon_phys_full / self.model.dataset_std
 
             x_target_extrap = x_full[: x_target.shape[0], :, time_slice:n_valid_full]
             x_recon_extrap = x_recon_full[

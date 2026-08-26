@@ -9,7 +9,6 @@ w_i the abundances and lambda_i the per-sample decay rates. Three reconstruction
 variants are provided; the decoder in ``vae.py`` selects one via ``physics_model``.
 """
 
-from typing import Optional
 
 import numpy as np
 

@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from lumos.types import DecompositionResult, SpectralData
 from lumos.physics import effective_to_physical_abundance
 
@@ -133,7 +132,6 @@ def sample_posterior(
     Returns:
         ensemble : dict with keys
             'raman'              [N, W]        - Raman rate (counts/sec)
-            'c_fluo'             [N, W]        - permanent polynomial baseline (counts/sec)
             'rates'              [N, F]        - decay rates (s^-1)
             'abundances'         [N, F]        - physical abundances
             'bases'              [N, F, W]     - normalised fluorophore spectra
@@ -145,7 +143,6 @@ def sample_posterior(
     if physics_model is None:
         physics_model = model.model.physics_model
 
-    _std = float(model.hparams.dataset_std)
     n_train = model.hparams.n_times_train
 
     frame_dur = getattr(model.model, "frame_duration", 0.1)
@@ -164,7 +161,9 @@ def sample_posterior(
     with torch.no_grad():
         x_input = sample_tensor[:, :, :n_train]
         for _ in range(n_predictions):
-            _, _, _, lambdas, abundances, raman, bases, _ = model.model(x_input)
+            _, _, _, lambdas, abundances, raman, bases = model.model(
+                x_input, sample=n_predictions > 1
+            )
 
             lambdas_np = lambdas.squeeze(0).cpu().numpy()
             abundances_np = abundances.squeeze(0).cpu().numpy()
@@ -181,7 +180,7 @@ def sample_posterior(
             bases_list.append(bases.cpu().numpy())
 
             # Re-run physics at the requested time axis.
-            # total_static = raman + c_fluo: both are ADU/s static floors.
+            # Re-run physics at the requested time axis.
             x_full, _ = model.model.physics_forward(
                 lambdas,
                 abundances,
@@ -217,8 +216,6 @@ def sample_posterior(
     # Using mean parameters (not mean reconstructions) keeps DecompositionResult
     # self-consistent - its .reconstruction(t) method always re-derives from params.
 
-    # import pybaselines as pb
-
     wn = model.model.wavenumbers.cpu().numpy()
     mean_raman = ramans_arr.mean(axis=0)
     # [W] counts/sec - Raman peaks only
@@ -226,8 +223,6 @@ def sample_posterior(
     mean_abunds = abundances_arr.mean(axis=0)  # [F]
     mean_bases = bases_arr.mean(axis=0)  # [F, W]
 
-    # DecompositionResult has no c_fluo field, so fold it into raman so that
-    # the static floor shown in visualise_decomposition matches the reconstruction.
     decomposition = DecompositionResult(
         raman=SpectralData(mean_raman, wavenumbers=wn),
         fluorophore_spectra=SpectralData(mean_bases, wavenumbers=wn),
