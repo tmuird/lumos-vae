@@ -45,7 +45,6 @@ class DecompositionEvalCallback(pl.Callback):
             return
         chosen = np.linspace(0, len(val_ds) - 1, n, dtype=int)
 
-        physics_model = pl_module.model.physics_model
         cosines = []
         for idx in chosen:
             sample = val_ds[int(idx)][0].unsqueeze(0)  # [1, W, T]
@@ -53,7 +52,6 @@ class DecompositionEvalCallback(pl.Callback):
                 pl_module,
                 sample,
                 n_predictions=1,
-                physics_model=physics_model,
             )
             pred_raman = ensemble["raman"].mean(axis=0)  # [W]
             cosines.append(_cosine(pred_raman, gt_raman[int(idx)]))

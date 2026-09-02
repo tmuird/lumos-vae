@@ -10,59 +10,9 @@ from lumos.types import DecompositionResult, SpectralData
 from lumos.physics import effective_to_physical_abundance
 
 
-def filter_active_components(
-    decomposition: DecompositionResult,
-    threshold: float = 0.01,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Filter to fluorophore components with significant abundance.
-
-    Useful in dictionary mode where most abundances should be near zero.
-
-    Args:
-        decomposition: Full DecompositionResult from predict.
-        threshold: Fraction of max abundance below which components are dropped.
-
-    Returns:
-        Tuple of (active_indices, active_spectra, active_abundances, active_rates)
-        where each array only contains the significant components.
-    """
-    abundances = decomposition.abundances
-    if abundances.ndim == 1:
-        abs_abundances = np.abs(abundances)
-    else:
-        # Per-sample: use mean abundance across batch
-        abs_abundances = np.abs(abundances).mean(axis=0)
-
-    max_abundance = abs_abundances.max()
-    if max_abundance == 0:
-        return np.array([], dtype=int), np.array([]), np.array([]), np.array([])
-
-    active_mask = abs_abundances > threshold * max_abundance
-    active_indices = np.where(active_mask)[0]
-
-    spectra = decomposition.fluorophore_spectra.data
-    rates = decomposition.rates
-
-    if abundances.ndim == 1:
-        return (
-            active_indices,
-            spectra[active_indices],
-            abundances[active_indices],
-            rates[active_indices],
-        )
-    else:
-        return (
-            active_indices,
-            spectra[active_indices],
-            abundances[:, active_indices],
-            rates[:, active_indices],
-        )
-
-
 def predict(
     model,
     early_data,
-    physics_model,
     dataset=None,
     n_early=20,
     n_predictions=1,
@@ -78,7 +28,6 @@ def predict(
     Args:
         model:         Trained VAEModule.
         early_data:    [1, W, T] normalised tensor.
-        physics_model: Physics model name (must match training config).
         n_early:       How many early timepoints the encoder sees.
         n_predictions: Stochastic draws to average (1 = deterministic eval mode).
         stochastic:    Ignored when n_predictions > 1 (always stochastic then).
@@ -90,7 +39,6 @@ def predict(
         model,
         early_data[:, :, :n_early] if early_data.shape[-1] > n_early else early_data,
         n_predictions=n_pred,
-        physics_model=physics_model,
         return_decomposition=True,
     )
     # Second return value: MMSE reconstruction averaged over ensemble [T_out, W]
@@ -102,7 +50,6 @@ def sample_posterior(
     model,
     sample_tensor: torch.Tensor,
     n_predictions: int = 50,
-    physics_model: Optional[str] = None,
     t_reconstruct: Optional[np.ndarray] = None,
     return_decomposition: bool = False,
 ) -> dict:
@@ -122,7 +69,6 @@ def sample_posterior(
         sample_tensor:       [1, W, T] normalised input tensor.
         n_predictions:       Number of stochastic samples.  Use 1 for a deterministic
                              point estimate (model is put in eval mode).
-        physics_model:       Overrides model physics_model if provided.
         t_reconstruct:       [T_out] time axis (seconds) for the reconstruction.
                              Defaults to model.model.t (the full training time axis).
         return_decomposition: If True, also return a DecompositionResult built from
@@ -140,9 +86,6 @@ def sample_posterior(
         decomposition : DecompositionResult (only when return_decomposition=True)
             Built from ensemble-mean parameters; suitable for visualise_decomposition.
     """
-    if physics_model is None:
-        physics_model = model.model.physics_model
-
     n_train = model.hparams.n_times_train
 
     frame_dur = getattr(model.model, "frame_duration", 0.1)
@@ -168,11 +111,10 @@ def sample_posterior(
             lambdas_np = lambdas.squeeze(0).cpu().numpy()
             abundances_np = abundances.squeeze(0).cpu().numpy()
 
-            # factored model outputs effective amplitudes - convert to physical
-            if physics_model == "factored":
-                abundances_np = effective_to_physical_abundance(
-                    abundances_np, lambdas_np, frame_dur
-                )
+            # The factored model outputs effective amplitudes.
+            abundances_np = effective_to_physical_abundance(
+                abundances_np, lambdas_np, frame_dur
+            )
 
             ramans.append(raman.squeeze(0).cpu().numpy())
             rates_list.append(lambdas_np)
@@ -228,7 +170,6 @@ def sample_posterior(
         fluorophore_spectra=SpectralData(mean_bases, wavenumbers=wn),
         abundances=mean_abunds,
         rates=mean_rates,
-        physics_model=physics_model,
         frame_duration=frame_dur,
     )
     return ensemble, decomposition

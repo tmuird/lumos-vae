@@ -29,9 +29,4 @@ class DecompositionResult:
     fluorophore_spectra: SpectralData
     abundances: Optional[np.ndarray] = None
     rates: Optional[np.ndarray] = None
-    physics_model: Optional[str] = None
     frame_duration: Optional[float] = None
-
-    @property
-    def time_constants(self) -> np.ndarray:
-        return 1.0 / self.rates

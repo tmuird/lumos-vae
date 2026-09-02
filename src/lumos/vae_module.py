@@ -4,14 +4,43 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 from torch.nn import functional as F
-from lumos.vae import VAE, _FWHM_G_MIN, _FWHM_L_MIN
+from lumos.vae import VAE
+
+
+
+_RETIRED = {
+    "sum_channel": False,
+    "raman_rank": 0,
+    "diff_loss_weight": 0.0,
+    "integrate_target": 0,
+    "temporal_pool": "mean",
+    "log1p": False,
+    "center_input": False,
+    "encoder_norm": "none",
+    "ordered_peaks": False,
+    "basis_mode": "mog",
+    "decay_mode": "per_sample",
+    "physics_model": "factored",
+    "dictionary_bases": None,
+    "raman_mode": None,
+}
+
+
+def _reject_retired(kwargs):
+    stale = {k: kwargs[k] for k, ok in _RETIRED.items()
+             if k in kwargs and kwargs[k] != ok}
+    if stale:
+        raise ValueError(
+            f"Checkpoint was trained with removed options {stale}. The current "
+            f"code cannot reproduce it; load it with the pre-cleanup revision "
+            f"or retrain."
+        )
 
 
 class VAEModule(pl.LightningModule):
 
     def __init__(
         self,
-        physics_model: str = "pointsample",
         n_wavenumbers: int = 1024,
         n_times_train: int = 1,
         n_full_timepoints: Optional[int] = None,
@@ -19,6 +48,9 @@ class VAEModule(pl.LightningModule):
         wavenumbers: Optional[torch.Tensor] = None,
         dataset_std: float = 1.0,
         dataset_mean: float = 0.0,
+        pool_spectral: int = 16,
+        pool_time: int = 1,
+        sum_loss_weight: float = 0.0,
         latent_dim: int = 32,
         hidden_dim: int = 128,
         decoder_dim: int = 256,
@@ -28,16 +60,12 @@ class VAEModule(pl.LightningModule):
         noise_alpha_gt: float = 0.0,
         noise_beta_gt: float = 0.0,
         t_sampling: str = "",
-        raman_lr_multiplier: float = 1.0,
-        mog_lr_multiplier: float = 3.0,
-        noise_lr_multiplier: float = 10.0,
-        shape_lr_multiplier: float = 10.0,
-        lambda_lr_multiplier: float = 10.0,
         lr_scheduler_patience: int = 50,
         lr_schedule: str = "plateau",
         **model_kwargs,
     ):
         super().__init__()
+        _reject_retired(model_kwargs)
         self.save_hyperparameters(ignore=["time_values", "wavenumbers"])
 
         self.log_alpha = nn.Parameter(torch.tensor(-4.0))
@@ -66,10 +94,11 @@ class VAEModule(pl.LightningModule):
             n_wavenumbers=n_wavenumbers,
             n_times_train=n_times_train,
             n_full_timepoints=n_full_timepoints,
-            physics_model=physics_model,
             dataset_std=dataset_std,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
+            pool_spectral=pool_spectral,
+            pool_time=pool_time,
             decoder_dim=decoder_dim,
             **model_kwargs,
         )
@@ -110,9 +139,6 @@ class VAEModule(pl.LightningModule):
         n_w = wavs.shape[0] if wavs is not None else 1024
         n_t_total = time_vals.shape[0]
 
-        dictionary_bases = None
-        if hasattr(ds, "dictionary_bases") and ds.dictionary_bases is not None:
-            dictionary_bases = torch.as_tensor(ds.dictionary_bases, dtype=torch.float32)
 
         frame_duration = getattr(datamodule.config, "bleaching_interval", 0.1)
 
@@ -145,9 +171,7 @@ class VAEModule(pl.LightningModule):
             n_wavenumbers=n_w,
             n_times_train=n_times_train,
             n_full_timepoints=n_t_total,
-            physics_model=datamodule.config.physics_model,
             dataset_std=std,
-            dictionary_bases=dictionary_bases,
             frame_duration=frame_duration,
             noise_alpha_gt=noise_alpha_gt,
             noise_beta_gt=noise_beta_gt,
@@ -159,6 +183,21 @@ class VAEModule(pl.LightningModule):
     def configure_gradient_clipping(
         self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
     ):
+
+        finite = all(
+            torch.isfinite(p.grad).all()
+            for p in self.parameters() if p.grad is not None
+        )
+        if not finite:
+            self._skipped_steps = getattr(self, "_skipped_steps", 0) + 1
+            if self._skipped_steps in (1, 10, 100, 1000):
+                print(
+                    f"non-finite gradient at step {self.global_step}, skipping "
+                    f"({self._skipped_steps} so far)"
+                )
+            optimizer.zero_grad(set_to_none=True)
+            return
+
         clip_val = gradient_clip_val if gradient_clip_val is not None else 1.0
         self.clip_gradients(
             optimizer, gradient_clip_val=clip_val, gradient_clip_algorithm="norm"
@@ -174,102 +213,13 @@ class VAEModule(pl.LightningModule):
             self.model.mog_means.register_hook(_hook)
 
     def configure_optimizers(self):
-        dec = self.model.decoder
-        if self.model.raman_mode == "pseudo_voigt":
-            raman_params = set(dec.head_raman_amplitudes.parameters())
-            global_shape_params = {
-                self.model.peak_positions_raw,
-                self.model.log_fwhm_L,
-                self.model.log_fwhm_G,
-            }
-        else:
-            raman_params = set(dec.head_raman.parameters()) | set(
-                dec.trunk_raman.parameters()
-            )
-            global_shape_params = set()
-        raman_param_ids = {id(p) for p in raman_params | global_shape_params}
-
-        mog_mean_params = set()
-        mog_scale_params = set()
-        if hasattr(self.model, "mog_means"):
-            mog_mean_params = {self.model.mog_means, self.model.mog_logits}
-            mog_scale_params = {self.model.mog_log_scales}
-
-        mog_param_ids = {id(p) for p in mog_mean_params | mog_scale_params}
-
-        # Global rates, if present, train as their own group.
-        lambda_params = set()
-        if hasattr(self.model, "log_lambda_global"):
-            lambda_params = {self.model.log_lambda_global}
-        lambda_param_ids = {id(p) for p in lambda_params}
-
-        # Global shape parameters get their own learning rate. Left in the base
-        # group they receive too little gradient to move from initialisation.
-        shape_params = [p for p in global_shape_params if p.requires_grad]
-
-        base_params = [
-            p
-            for p in self.model.parameters()
-            if id(p) not in raman_param_ids
-            and id(p) not in mog_param_ids
-            and id(p) not in lambda_param_ids
-        ]
-
-        param_groups = [
-            {"params": base_params},
-            {
-                "params": [self.log_alpha, self.log_beta],
-                "lr": self.hparams.learning_rate * self.hparams.noise_lr_multiplier,
-            },
-            {
-                "params": list(raman_params),
-                "lr": self.hparams.learning_rate * self.hparams.raman_lr_multiplier,
-            },
-        ]
-
-        if shape_params:
-            param_groups.append(
-                {
-                    "params": shape_params,
-                    "lr": self.hparams.learning_rate * self.hparams.shape_lr_multiplier,
-                }
-            )
-        if lambda_params:
-            param_groups.append(
-                {
-                    "params": list(lambda_params),
-                    "lr": self.hparams.learning_rate
-                    * self.hparams.lambda_lr_multiplier,
-                }
-            )
-
-        if mog_mean_params:
-            param_groups.append(
-                {
-                    "params": list(mog_mean_params),
-                    "lr": self.hparams.learning_rate
-                    * self.hparams.mog_lr_multiplier
-                    * 3.0,
-                }
-            )
-        if mog_scale_params:
-            param_groups.append(
-                {
-                    "params": list(mog_scale_params),
-                    "lr": self.hparams.learning_rate * self.hparams.mog_lr_multiplier,
-                }
-            )
-
+        # One learning rate for everything
         optimizer = torch.optim.AdamW(
-            param_groups,
+            self.parameters(),
             lr=self.hparams.learning_rate,
             weight_decay=1e-4,
         )
         if self.hparams.lr_schedule == "cosine":
-            # Anneals on a fixed trajectory, so two runs are comparable. Plateau
-            # keys off val_recon_loss, which does not track reconstruction
-            # quality here, and its patience counts validation checks rather
-            # than epochs, so it can fail to anneal at all within a run.
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=self.trainer.max_epochs,
@@ -308,11 +258,7 @@ class VAEModule(pl.LightningModule):
 
         B, W, T_max = x_full.shape
 
-        # Batches are homogeneous in frame count, so one window length serves the
-        # whole batch. The ceiling is whatever this batch actually has, which
-        # lets a store mix a long photobleaching series with short acquisitions.
-        # The encoder pools over time, so a model trained at a single length
-        # fails at any other; sampling the length covers the range.
+        # Batches are homogeneous in frame count
         limit = min(self.hparams.n_times_train, int(lengths.min()))
         if self._t_choices is not None:
             usable = [t for t in self._t_choices if t <= limit] or [limit]
@@ -378,6 +324,17 @@ class VAEModule(pl.LightningModule):
             loss = loss + self.hparams.raman_l1_weight * rl1_penalty
             self.log("raman_l1_penalty", rl1_penalty, prog_bar=False)
 
+        if self.hparams.sum_loss_weight > 0 and time_slice > 1:
+
+            pred_sum = x_recon_norm.sum(-1)
+            targ_sum = x_target.sum(-1)
+            var_sum = (self.noise_alpha * pred_sum.clamp(min=0.0)
+                       + time_slice * self.noise_beta).clamp(min=1e-6)
+            sum_loss = (0.5 * (targ_sum - pred_sum).pow(2) / var_sum
+                        + 0.5 * var_sum.log()).mean()
+            loss = loss + self.hparams.sum_loss_weight * sum_loss
+            self.log("sum_loss", sum_loss, prog_bar=False)
+
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_mse", mse, prog_bar=False)
         self.log("recon_loss", recon_loss, prog_bar=True)
@@ -401,12 +358,15 @@ class VAEModule(pl.LightningModule):
             self.log("recon_mse", mse, prog_bar=False)
 
             if hasattr(self.model, "log_fwhm_L"):
-                f_L = F.softplus(self.model.log_fwhm_L) + _FWHM_L_MIN
-                f_G = F.softplus(self.model.log_fwhm_G) + _FWHM_G_MIN
+                # Must match the forward pass, including the pin.
+                f_L = F.softplus(self.model.log_fwhm_L) + self.model.width_floor
+                f_G = (self.model.log_fwhm_G.new_tensor(self.model.fwhm_G_pinned)
+                       if self.model.fwhm_G_pinned
+                       else F.softplus(self.model.log_fwhm_G) + self.model.width_floor)
                 self.log("fwhm_G", f_G.detach(), prog_bar=True)
                 self.log("fwhm_L_mean", f_L.mean().detach(), prog_bar=True)
                 self.log("fwhm_L_min", f_L.min().detach(), prog_bar=False)
-                self.log("fwhm_L_max", f_L.max().detach(), prog_bar=False)
+                self.log("fwhm_L_widest", f_L.max().detach(), prog_bar=False)
 
             if hasattr(self.model, "mog_means"):
                 scales = self.model.mog_log_scales.exp()
@@ -418,11 +378,7 @@ class VAEModule(pl.LightningModule):
                     self.log(
                         "mog_means_grad_norm", self._mog_means_grad_norm, prog_bar=True
                     )
-            opt = self.optimizers()
-            self.log("lr", opt.param_groups[0]["lr"], prog_bar=False)
-            self.log("lr_raman", opt.param_groups[1]["lr"], prog_bar=False)
-            if len(opt.param_groups) > 2:
-                self.log("lr_mog", opt.param_groups[2]["lr"], prog_bar=False)
+            self.log("lr", self.optimizers().param_groups[0]["lr"], prog_bar=False)
 
         return loss
 

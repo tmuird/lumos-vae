@@ -5,8 +5,9 @@ The observation model for a CCD integrating over each frame of duration ``T`` is
     S_n(nu) = S(nu)*T + sum_i w_i * B_i(nu) * exp(-lambda_i * t_n) * (1 - exp(-lambda_i*T)) / lambda_i
 
 where S(nu) is the static Raman spectrum, B_i the fluorophore basis spectra,
-w_i the abundances and lambda_i the per-sample decay rates. Three reconstruction
-variants are provided; the decoder in ``vae.py`` selects one via ``physics_model``.
+w_i the abundances and lambda_i the per-sample decay rates. The factored form
+below rewrites this so the decoder emits the observable amplitude directly,
+which removes the amplitude-rate identifiability problem.
 """
 
 
@@ -90,78 +91,6 @@ def effective_to_physical_abundance(
 
 
 if TORCH_AVAILABLE:
-
-    def evaluate_polynomial_bases_torch(
-        log_poly_coeffs: "torch.Tensor",
-        wn_normalised: "torch.Tensor",
-    ) -> "torch.Tensor":
-        """Evaluate log-polynomial fluorophore bases, then exponentiate.
-
-        ``log_poly_coeffs`` has shape (n_fluorophores, degree+1) in ascending
-        power order; ``wn_normalised`` is the wavenumber axis in [-1, 1].
-        """
-        degree = log_poly_coeffs.shape[1] - 1
-        vandermonde = torch.vander(wn_normalised, N=degree + 1, increasing=True)
-        if log_poly_coeffs.dtype != vandermonde.dtype:
-            vandermonde = vandermonde.to(log_poly_coeffs.dtype)
-        log_intensity_values = torch.matmul(log_poly_coeffs, vandermonde.T)
-        return torch.exp(log_intensity_values)
-
-    def reconstruct_time_series_torch(
-        raman: "torch.Tensor",  # [B, W]
-        bases: "torch.Tensor",  # [F, W] or [B, F, W]
-        abundances: "torch.Tensor",  # [B, F]
-        decay_rates: "torch.Tensor",  # [B, F]
-        time_values: "torch.Tensor",  # [T]
-        frame_duration: float = 0.1,
-    ) -> "torch.Tensor":
-        """Point-sampled decay: fluorescence(t) = sum_i w_i B_i exp(-lambda_i t).
-
-        Raman is treated as a rate and multiplied by ``frame_duration`` to give
-        counts per frame. Returns [B, W, T].
-        """
-        lam = decay_rates.unsqueeze(1)  # [B, 1, F]
-        t = time_values.view(1, -1, 1)  # [1, T, 1]
-        decay_matrix = torch.exp(-lam * t)  # [B, T, F]
-
-        w = abundances.unsqueeze(2)  # [B, F, 1]
-        weighted_bases = w * bases  # [B, F, W]
-
-        fluorescence = torch.matmul(decay_matrix, weighted_bases)  # [B, T, W]
-        raman_integrated = raman.unsqueeze(1) * frame_duration  # [B, 1, W]
-        total_signal = fluorescence + raman_integrated
-        return total_signal.transpose(1, 2)  # [B, W, T]
-
-    def reconstruct_time_series_integrated_torch(
-        raman: "torch.Tensor",  # [B, W]
-        bases: "torch.Tensor",  # [F, W]
-        abundances: "torch.Tensor",  # [B, F]
-        decay_rates: "torch.Tensor",  # [B, F]
-        time_values: "torch.Tensor",  # [T] frame start times
-        frame_duration: float = 0.1,
-    ) -> "torch.Tensor":
-        """CCD-integrated decay over each frame [t_n, t_n + T].
-
-            measured(n) = S*T + sum_i w_i B_i * (1/lambda_i) * [exp(-lambda_i t_n) - exp(-lambda_i (t_n+T))]
-
-        This is the physically correct model: fast components contribute near
-        zero because they bleach within the frame. Returns [B, W, T].
-        """
-        lam = decay_rates.unsqueeze(1)  # [B, 1, F]
-        t_start = time_values.view(1, -1, 1)  # [1, T, 1]
-        t_end = t_start + frame_duration
-        decay_matrix = (torch.exp(-lam * t_start) - torch.exp(-lam * t_end)) / (
-            lam + 1e-8
-        )  # [B, T, F]
-
-        w = abundances.unsqueeze(2)  # [B, F, 1]
-        B = bases.unsqueeze(0)  # [1, F, W]
-        weighted_bases = w * B  # [B, F, W]
-
-        fluorescence = torch.matmul(decay_matrix, weighted_bases)  # [B, T, W]
-        raman_integrated = raman.unsqueeze(1) * frame_duration
-        total_signal = fluorescence + raman_integrated
-        return total_signal.transpose(1, 2)  # [B, W, T]
 
     def reconstruct_time_series_factored_torch(
         raman: "torch.Tensor",  # [B, W]

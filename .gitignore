@@ -30,3 +30,7 @@ data/
 .vscode/
 .ipynb_checkpoints/
 .DS_Store
+
+# Assistant scratch files, not part of the project.
+CLAUDE.md
+.claude/

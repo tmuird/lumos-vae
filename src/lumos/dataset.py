@@ -13,9 +13,9 @@ class BleachingDataset(Dataset):
         normalize=True,
         initial_bases=None,
         n_times_train=None,
-        dictionary_bases=None,
         lengths=None,
         device=None,
+        lazy=False,
     ):
         """
         Args:
@@ -24,27 +24,31 @@ class BleachingDataset(Dataset):
             normalize (bool): Divide by the standard deviation. No mean is
                 subtracted, since the physics output is non-negative.
             n_times_train (int): Number of training timepoints (compute stats only from these)
-            dictionary_bases (np.ndarray): Optional [D, W] dictionary for dictionary mode
+            lazy (bool): Read each sample from the store on demand instead of
+                holding the whole array in memory. Only for stores too large to
+                fit; per-sample isel() carries heavy Python overhead and throttles
+                the DataLoader, so eager is the default.
         """
         self.labels = labels
         self.n_times_train = n_times_train
         self.time_values = time_values
         self.wavenumbers = wavenumbers
         self.fluorophore_bases_gt = initial_bases
-        self.dictionary_bases = dictionary_bases
         self.normalize = normalize
         # Per-spot valid frame counts (None for synthetic / fixed-length data).
         # Frames beyond lengths[i] are zero-padding and should not be visualised.
         self.lengths = lengths
 
-        # Detect truly lazy (dask/zarr-backed) xarray DataArrays.
-        # Numpy-backed xarrays are loaded eagerly - per-sample isel() in __getitem__
-        # has high Python overhead and kills DataLoader throughput.
         import xarray as xr
 
         _is_xarray = isinstance(intensities, xr.DataArray)
-        _is_dask = _is_xarray and hasattr(intensities.data, "__dask_graph__")
-        self._lazy = _is_dask
+        # Explicit, not inferred from whether dask is importable.
+        self._lazy = bool(lazy)
+        if self._lazy and not _is_xarray:
+            raise TypeError(
+                "lazy loading needs an xarray DataArray backed by the store, "
+                f"got {type(intensities).__name__}"
+            )
 
         if self._lazy:
             self._lazy_data = intensities  # truly zarr/dask-backed, not loaded into RAM
@@ -97,28 +101,6 @@ class BleachingDataset(Dataset):
         valid_length_tensor = torch.tensor(valid_length, dtype=torch.long)
 
         return sample, label, valid_length_tensor
-
-    def get_full(self, idx) -> torch.Tensor:
-        """Return the complete valid time series for sample idx as [W, valid_T].
-
-        Never used during training - intended for evaluation, visualisation,
-        and the extrap loss callback which need the full unpadded series.
-        """
-        if self._lazy:
-            sample = torch.from_numpy(
-                self._lazy_data.isel(sample=int(idx)).values
-            ).float()
-        else:
-            sample = self.data[idx]
-
-        if self.normalize:
-            sample = sample / (self.std + 1e-8)
-        sample = sample.transpose(0, 1)  # [W, T_max]
-
-        valid_T = (
-            int(self.lengths[idx]) if self.lengths is not None else sample.shape[-1]
-        )
-        return sample[:, :valid_T]  # [W, valid_T]
 
     def __getitems__(self, indices):
         """Batch-load for lazy data: one xarray read instead of N individual isel() calls."""

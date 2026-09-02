@@ -59,16 +59,25 @@ class ZarrDataModule(pl.LightningDataModule):
         normalize: bool = True,
         preload_device=None,
         transductive: bool = True,
+        lazy: bool = False,
+        n_train: int = 0,
+        seed: int = 0,
     ):
         super().__init__()
         self.zarr_path = zarr_path
         self.config = config
         self.batch_size = batch_size
-        self.num_workers = 0 if preload_device is not None else num_workers
+        self.num_workers = num_workers if lazy else 0
         self.n_times_train = n_times_train
         self.normalize = normalize
-        self.preload_device = preload_device
+        self.preload_device = None if lazy else preload_device
         self.transductive = transductive
+        self.lazy = lazy
+        # Cap the training pool, to measure how performance scales with the
+        # number of bleaching series. 0 uses everything.
+        self.n_train = n_train
+        self.seed = seed
+        # Fixed fluorophore emission spectra, when the dyes are known in advance.
 
         self.full_ds = None
         self.val_ds = None
@@ -96,6 +105,9 @@ class ZarrDataModule(pl.LightningDataModule):
         time_values = ds.coords["time"].values
 
         train_idx = np.where(split_arr == "train")[0]
+        if self.n_train and self.n_train < len(train_idx):
+            rng = np.random.default_rng(self.seed)
+            train_idx = np.sort(rng.permutation(train_idx)[:self.n_train])
         val_idx = np.where(split_arr == "val")[0]
         test_idx = np.where(split_arr == "test")[0]
 
@@ -136,12 +148,10 @@ class ZarrDataModule(pl.LightningDataModule):
                 n_times_train=self.n_times_train,
                 normalize=self.normalize,
                 device=self.preload_device,
+                lazy=self.lazy,
             )
 
-        # Training pool. Fitting is unsupervised, so including the test spectra
-        # leaks no labels, but it does mean reporting on spectra the model has
-        # seen, which is not comparable to a supervised baseline scored on held
-        # out data. Inductive is therefore the default.
+        # Transductive fitting leaks no labels but reports on seen spectra.
         fit_idx = np.concatenate([train_idx, test_idx]) if self.transductive else train_idx
         print(
             f"  fitting on {len(fit_idx)} spectra "

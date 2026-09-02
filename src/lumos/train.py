@@ -8,6 +8,7 @@ frames. Any ground truth in the store is used only for logging.
 """
 
 import argparse
+import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,47 +27,30 @@ torch.set_float32_matmul_precision("medium")
 # Model and trainer defaults. The only data input is a processed Zarr store.
 DEFAULTS = dict(
     # Model
-    basis_mode="mog",
     latent_dim=64,
     hidden_dim=128,
     decoder_dim=256,
-    physics_model="factored",
     learning_rate=5e-4,
     kl_weight=1.0,
     n_gaussian_components=3,
-    polynomial_degree=3,
     raman_l1_weight=0.01,
-    raman_lr_multiplier=3.0,
-    mog_lr_multiplier=3.0,
-    noise_lr_multiplier=10.0,
-    shape_lr_multiplier=10.0,
-    lambda_lr_multiplier=10.0,
+    deterministic=False,
     lambda_min=0.001,
-    # Input window length sampled per step. "uniform" spans 1..n_times_train and
-    # lets one model serve any window length. It needs roughly twice the epochs,
-    # since only one step in n sees the full window, but given that budget it
-    # matches a fixed-window model at full length and stays within 0.013 Pearson
-    # down to a single frame. "" fixes the window at n_times_train. An explicit
-    # set such as "2,16" also works; "1,16" is unstable and diverges.
     t_sampling="uniform",
-    # Encoder conv widths, four layers. This stack is ~90% of the parameters, so
-    # it is the only effective size control. 8,16,32,64 is 0.49M parameters and
-    # matches 64,128,256,512 (4.00M) on every metric measured.
     conv_channels="8,16,32,64",
-    decay_mode="per_sample",  # "per_sample" | "global" | "global_scaled"
-    raman_mode="pseudo_voigt",
     n_raman_peaks=300,
-    fwhm_G_init=5.0,
-    fwhm_G_trainable=True,
-    n_fluorophores=3,
-    n_model_components=16,
-    # Data
+    pool_spectral=16,
+    pool_time=1,
+    sum_loss_weight=0.0,
+    # Known instrument response in cm^-1.
+    fwhm_G=0.0,
+    # a sample contains; the abundances decide that.
+    n_fluorophores=16,
     n_times_train=16,
-    # Fit on the test spectra as well. The model is unsupervised, so it can use
-    # them where a supervised baseline cannot, and this matches the deployment
-    # case where the spectra to be corrected are in hand. Set False for a
-    # strictly held-out estimate.
     transductive=True,
+    n_train=0,
+    # Read the whole store into memory, and onto the GPU when there is one.
+    lazy=False,
     # Trainer
     max_epochs=2000,
     batch_size=8,
@@ -81,6 +65,8 @@ DEFAULTS = dict(
     steps_per_epoch=200,
     val_check_steps=500,
     seed=8,
+    # Run directory name. Empty builds one from the settings that vary.
+    run_name="",
 )
 
 
@@ -101,7 +87,6 @@ def _read_store_config(zarr_path: str, cfg: dict):
         return default
 
     return SimpleNamespace(
-        physics_model=cfg["physics_model"],
         bleaching_interval=float(pick(["frame_duration_s", "frame_duration"], 0.1)),
         noise_type=str(
             pick(["injected_noise_type", "noise_type", "synthesis_noise_type"],
@@ -136,8 +121,11 @@ def build_datamodule(cfg: dict) -> ZarrDataModule:
         num_workers=cfg["num_workers"],
         n_times_train=cfg["n_times_train"],
         transductive=cfg["transductive"],
+        n_train=cfg["n_train"],
+        seed=cfg["seed"],
         normalize=True,
         preload_device=_preload_device(),
+        lazy=cfg["lazy"],
     )
 
 
@@ -148,50 +136,53 @@ def build_model(cfg: dict, dm: ZarrDataModule) -> VAEModule:
         decoder_dim=cfg["decoder_dim"],
         learning_rate=cfg["learning_rate"],
         kl_weight=cfg["kl_weight"],
-        basis_mode=cfg["basis_mode"],
         lambda_min=cfg["lambda_min"],
-        decay_mode=cfg["decay_mode"],
         raman_l1_weight=cfg["raman_l1_weight"],
-        raman_lr_multiplier=cfg["raman_lr_multiplier"],
-        mog_lr_multiplier=cfg["mog_lr_multiplier"],
-        noise_lr_multiplier=cfg["noise_lr_multiplier"],
-        shape_lr_multiplier=cfg["shape_lr_multiplier"],
-        lambda_lr_multiplier=cfg["lambda_lr_multiplier"],
-        raman_mode=cfg["raman_mode"],
         n_raman_peaks=cfg["n_raman_peaks"],
-        fwhm_G_init=cfg["fwhm_G_init"],
-        fwhm_G_trainable=cfg["fwhm_G_trainable"],
+        pool_spectral=cfg["pool_spectral"],
+        pool_time=cfg["pool_time"],
+        sum_loss_weight=cfg["sum_loss_weight"],
+        fwhm_G=cfg["fwhm_G"],
         lr_scheduler_patience=cfg["lr_scheduler_patience"],
         lr_schedule=cfg["lr_schedule"],
-        polynomial_degree=cfg["polynomial_degree"],
         t_sampling=cfg["t_sampling"],
         conv_channels=cfg["conv_channels"],
     )
-    n_model = cfg["n_model_components"] or cfg["n_fluorophores"]
-    if cfg["basis_mode"] == "mog":
-        model_kwargs["n_gaussian_components"] = cfg["n_gaussian_components"]
-        model_kwargs["n_fluorophores"] = n_model
-    elif cfg["basis_mode"] == "polynomial":
-        model_kwargs["n_fluorophores"] = n_model
-    else:
-        raise ValueError(
-            f"basis_mode='{cfg['basis_mode']}' needs an external fluorophore "
-            f"dictionary. Use 'mog' or 'polynomial'."
-        )
+    model_kwargs["n_gaussian_components"] = cfg["n_gaussian_components"]
+    model_kwargs["n_fluorophores"] = cfg["n_fluorophores"]
     return VAEModule.from_datamodule(dm, **model_kwargs)
 
 
 def make_run_name(cfg: dict) -> str:
+    """Directory name for a run, carrying the settings that usually differ.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = Path(cfg["data"]).stem
-    return (
-        f"{stem}_{cfg['basis_mode']}_t{cfg['n_times_train']}"
-        f"_z{cfg['latent_dim']}_h{cfg['hidden_dim']}_lr{cfg['learning_rate']}_{ts}"
+    if cfg["run_name"]:
+        return f"{cfg['run_name']}_{ts}"
+
+    sampling = {"": "fixed", "uniform": "uniform"}.get(
+        cfg["t_sampling"], cfg["t_sampling"].replace(",", "-")
     )
+    return "_".join([
+        Path(cfg["data"]).stem,
+        f"t{cfg['n_times_train']}",
+        "c" + cfg["conv_channels"].replace(",", "-"),
+        f"z{cfg['latent_dim']}h{cfg['hidden_dim']}",
+        sampling,
+        "trans" if cfg["transductive"] else "induct",
+        f"s{cfg['seed']}",
+        ts,
+    ])
 
 
 def train(cfg: dict):
     pl.seed_everything(cfg["seed"], workers=True)
+    if cfg["deterministic"]:
+
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     dm = build_datamodule(cfg)
     dm.setup()
@@ -203,10 +194,15 @@ def train(cfg: dict):
     val_every = max(1, round(cfg["val_check_steps"] / max(1, batches)))
 
     steps_per_val = val_every * batches
+    # Early stopping is skipped under cosine: cutting a fixed horizon short
+    # leaves the model at whatever rate it had reached, undoing the annealing.
+    early_stop = cfg["early_stopping_patience"] > 0 and cfg["lr_schedule"] != "cosine"
     print(
         f"Validating every {val_every} epoch(s) ({steps_per_val} steps). "
-        f"Early stop after {cfg['early_stopping_patience'] * steps_per_val} "
-        f"steps without improvement."
+        + (f"Early stop after {cfg['early_stopping_patience'] * steps_per_val} "
+           f"steps without improvement." if early_stop
+           else f"No early stopping ({cfg['lr_schedule']} schedule runs to "
+                f"{cfg['max_epochs']} epochs).")
     )
 
     model = build_model(cfg, dm)
@@ -223,10 +219,7 @@ def train(cfg: dict):
             monitor="val_recon_loss",
             mode="min",
         ),
-        # Written separately from the top-k callback. With save_last on a
-        # monitored callback, Lightning only refreshes last.ckpt when a top-k
-        # save fires, so it silently freezes at the last improvement and the
-        # final weights are never stored.
+
         ModelCheckpoint(
             dirpath=str(run_dir),
             filename="last",
@@ -234,10 +227,11 @@ def train(cfg: dict):
             monitor=None,
             every_n_epochs=val_every,
             enable_version_counter=False,
-        ),
+        ), #2 callbakcs one stores actual last other stores last out of top k
         DecompositionEvalCallback(dm, n_samples=4),
     ]
-    if cfg["early_stopping_patience"] > 0:
+
+    if early_stop:
         callbacks.append(
             EarlyStopping(
                 monitor="val_recon_loss",
@@ -322,7 +316,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--wandb", action=argparse.BooleanOptionalAction, default=True,
         help="Log to Weights and Biases (--no-wandb for the CSV logger only)",
     )
-    optional_int = {"n_model_components", "steps_per_epoch"}
+    optional_int = {"steps_per_epoch"}
     for key, val in DEFAULTS.items():
         if isinstance(val, bool):
             # BooleanOptionalAction gives --flag and --no-flag. store_true cannot
