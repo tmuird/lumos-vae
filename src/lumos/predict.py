@@ -102,7 +102,8 @@ def sample_posterior(
     ramans, rates_list, abundances_list, bases_list, recons = [], [], [], [], []
 
     with torch.no_grad():
-        x_input = sample_tensor[:, :, :n_train]
+        # A lazy datamodule hands back CPU batches while the model is on GPU.
+        x_input = sample_tensor[:, :, :n_train].to(next(model.parameters()).device)
         for _ in range(n_predictions):
             _, _, _, lambdas, abundances, raman, bases = model.model(
                 x_input, sample=n_predictions > 1

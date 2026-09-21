@@ -9,6 +9,7 @@ frames. Any ground truth in the store is used only for logging.
 
 import argparse
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +68,8 @@ DEFAULTS = dict(
     seed=8,
     # Run directory name. Empty builds one from the settings that vary.
     run_name="",
+    # Existing run directory to continue from its last.ckpt.
+    resume="",
 )
 
 
@@ -208,6 +211,15 @@ def train(cfg: dict):
     model = build_model(cfg, dm)
     run_name = make_run_name(cfg)
     run_dir = Path("checkpoints") / run_name
+    # Resuming writes back into the original directory and restores the
+    # optimiser and cosine schedule, which starting again would reset.
+    ckpt_path = None
+    if cfg["resume"]:
+        run_dir = Path("checkpoints") / cfg["resume"]
+        ckpt_path = run_dir / "last.ckpt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"No last.ckpt in {run_dir}")
+        print(f"Resuming from {ckpt_path}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     callbacks = [
@@ -258,10 +270,12 @@ def train(cfg: dict):
         gradient_clip_algorithm="norm",
         gradient_clip_val=cfg["gradient_clip_val"],
         enable_model_summary=False,
-        enable_progress_bar=True,
+        # A progress bar redirected to a file repaints into it, which grew the
+        # logs to 1.4 GB a run and filled the disk.
+        enable_progress_bar=sys.stdout.isatty(),
         log_every_n_steps=2,
     )
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
 
 
 def _resolve_run_dir(run_name=None, checkpoint_dir="checkpoints"):

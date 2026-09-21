@@ -23,6 +23,8 @@ _RETIRED = {
     "physics_model": "factored",
     "dictionary_bases": None,
     "raman_mode": None,
+    "raman_head": "voigt",
+    "background_head": "mog",
 }
 
 
@@ -35,6 +37,33 @@ def _reject_retired(kwargs):
             f"code cannot reproduce it; load it with the pre-cleanup revision "
             f"or retrain."
         )
+
+
+def _reject_capped(checkpoint):
+    """Reject checkpoints whose width was held down by the removed soft cap.
+
+    The cap asymptoted, so a run that sat against it stored a raw width far
+    above the value it actually trained with. Without the cap that raw value is
+    used directly and the model is a different one.
+    """
+    hp = checkpoint.get("hyper_parameters", {})
+    sd = checkpoint.get("state_dict", {})
+    for key, name in (("fwhm_G_max", "model.log_fwhm_G"),
+                      ("fwhm_L_max", "model.log_fwhm_L")):
+        hi = hp.get(key)
+        if not hi or name not in sd:
+            continue
+        floor = 1.0 if "log_fwhm_G" in name else 1.0
+        raw = F.softplus(sd[name]) + floor
+        scale = (hi - floor) / 10.0
+        capped = hi - scale * F.softplus((hi - raw) / scale)
+        drift = float((raw - capped).abs().max())
+        if drift > 0.1:
+            raise ValueError(
+                f"Checkpoint trained against the removed {key}={hi} cap, which "
+                f"held its width {drift:.1f} cm^-1 below the stored value. "
+                f"Loading it here rebuilds a different model; retrain it."
+            )
 
 
 class VAEModule(pl.LightningModule):
@@ -110,6 +139,9 @@ class VAEModule(pl.LightningModule):
     @property
     def noise_beta(self) -> torch.Tensor:
         return F.softplus(self.log_beta) + 1e-6
+
+    def on_load_checkpoint(self, checkpoint):
+        _reject_capped(checkpoint)
 
     @classmethod
     def from_datamodule(cls, datamodule, **kwargs):

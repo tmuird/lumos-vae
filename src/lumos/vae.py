@@ -282,7 +282,7 @@ class VAE(nn.Module):
         return F.conv1d(padded, kernel[None, None, :]).squeeze(1)
 
 
-    def forward(self, x, sample=None):
+    def forward(self, x, sample=None, scale=1):
         # x: [B, W, T] - std-normalised signal (may be slightly negative after dark subtraction)
 
         # Derive t_use from actual input length.
@@ -303,7 +303,7 @@ class VAE(nn.Module):
         # deterministic estimate at inference unless sampling is requested.
         if sample is None:
             sample = self.training
-        z = self.reparameterize(mu, logvar) if sample else mu
+        z = self.reparameterize(mu, logvar, scale) if sample else mu
 
         lambdas_raw, raman_out, abundances_raw = self.decoder(z)
 
@@ -367,8 +367,8 @@ class VAE(nn.Module):
 
         return x_recon, bases_normalised
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
+    def reparameterize(self, mu, logvar, scale=1.0):
+        std = torch.exp(0.5 * logvar) * scale
         return mu + torch.randn_like(std) * std
 
 
