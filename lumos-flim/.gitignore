@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+checkpoints/
+logs/
+lightning_logs/
+*.ckpt
+
+# Data and outputs stay local
+data/
+*.zarr/
+results/
+
+.pytest_cache/
+.venv/
+.ipynb_checkpoints/
+.DS_Store

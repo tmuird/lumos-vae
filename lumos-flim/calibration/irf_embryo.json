@@ -1,0 +1,21 @@
+{
+  "reference": "phasorpy-data/zenodo_8046636/Fluorescein_Embryo.tif",
+  "reference_tau": 4.2,
+  "bin_width_ns": 0.222909,
+  "fixed": {
+    "irf_t0": 1.2015549004374546,
+    "irf_sigma": 0.14279533957020946,
+    "tau": 4.2,
+    "background": 6.19919314601835e-08,
+    "chi2r": 77.70157598144836,
+    "photons": 5342209.0
+  },
+  "free": {
+    "irf_t0": 1.2096637382858273,
+    "irf_sigma": 0.14926215846805313,
+    "tau": 3.989524460905923,
+    "background": 0.016299008180166177,
+    "chi2r": 35.75165473563258,
+    "photons": 5342209.0
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "reference": "phasorpy-data/zenodo_8046636/Fluorescein_hMSC.tif",
+  "reference_tau": 4.2,
+  "bin_width_ns": 0.222909,
+  "fixed": {
+    "irf_t0": 0.4147749310081219,
+    "irf_sigma": 0.0873707572955758,
+    "tau": 4.2,
+    "background": 1.3902563504650013e-08,
+    "chi2r": 31468.28562225288,
+    "photons": 187699005.0
+  },
+  "free": {
+    "irf_t0": 0.44304991493602813,
+    "irf_sigma": 0.12060954223755838,
+    "tau": 3.5938153491689007,
+    "background": 0.013113773114843887,
+    "chi2r": 841.1095739609445,
+    "photons": 187699005.0
+  }
+}
