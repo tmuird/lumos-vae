@@ -128,3 +128,22 @@ def test_runs_on_device(device):
     loss = poisson_half_deviance(x, out["expected"]).mean()
     loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(module.model.irf_t0.grad)
+
+
+@pytest.mark.parametrize("tau,tail_tau", [(0.4, 0.25), (0.3, 0.3), (0.303, 0.3), (3.0, 0.25)])
+def test_tailed_irf_matches_photon_simulation(tau, tail_tau):
+    """Gaussian IRF with an exponential tail on 25% of photons, including a
+    tail rate equal to the decay rate, where the closed form is 0/0."""
+    rng = np.random.default_rng(1)
+    n, w = 2_000_000, 0.25
+    t = rng.normal(1.0, 0.1, n) + rng.exponential(tau, n)
+    tail = rng.random(n) < w
+    t[tail] += rng.exponential(tail_tau, tail.sum())
+    h = np.histogram(np.mod(t, PERIOD), bins=N_BINS, range=(0, PERIOD))[0]
+    p = decay_histograms(torch.tensor([1 / tau], dtype=torch.float64), 1.0, 0.1, N_BINS, BIN,
+                         tail_weight=torch.tensor(w, dtype=torch.float64),
+                         tail_rate=torch.tensor(1 / tail_tau, dtype=torch.float64))[0].numpy()
+    mu = n * p
+    ok = mu > 5
+    assert abs(p.sum() - 1) < 1e-6
+    assert ((h[ok] - mu[ok]) ** 2 / mu[ok]).sum() / ok.sum() < 1.6

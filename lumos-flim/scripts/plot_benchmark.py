@@ -15,26 +15,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from plot_evaluation import INK, INK_2, SEQ, SURFACE, _end_labels  # shared style
+from plot_evaluation import INK, INK_2, SEQ, SURFACE  # shared style
 
-# Reference categorical order, fixed (never cycled), validated on adjacent
-# pairs; several slots are under 3:1 on white, so every series also has its
-# own marker and a direct label.
+# The reference categorical palette in its fixed slot order (never cycled),
+# validated on adjacent pairs. With eight series, end labels collide, so
+# identity is carried by the legend and a distinct marker per series; the
+# README tables are the table view that the low-contrast slots require.
 STYLE = {
     "vae": ("#2a78d6", "o", "VAE"),
-    "vae_spatial": ("#eb6834", "D", "VAE + 3x3 context"),
-    "eb": ("#1baf7a", "^", "empirical Bayes"),
-    "tv": ("#eda100", "v", "TV-regularised"),
-    "binned": ("#e87ba4", "s", "3x3 binned"),
-    "global": ("#008300", "P", "global lifetimes"),
-    "mle": ("#4a3aa7", "X", "per-pixel MLE"),
+    "vae_spatial": ("#eb6834", "D", "VAE + summed 3x3"),
+    "vae_stack": ("#1baf7a", "^", "VAE + stacked 3x3"),
+    "eb": ("#eda100", "v", "empirical Bayes"),
+    "tv": ("#e87ba4", "s", "TV-regularised"),
+    "binned": ("#008300", "P", "3x3 binned"),
+    "global": ("#4a3aa7", "X", "global lifetimes"),
+    "mle": ("#e34948", "*", "per-pixel MLE"),
 }
-SHORT = {"vae": "VAE", "vae_spatial": "VAE+ctx", "eb": "EB", "tv": "TV", "binned": "binned",
+SHORT = {"vae": "VAE", "vae_spatial": "VAE+sum", "vae_stack": "VAE+stack", "eb": "EB", "tv": "TV", "binned": "binned",
          "global": "global", "mle": "MLE"}
 
 
 def _lines(ax, rows, key, skip=()):
-    ends = []
     for m, (c, mk, label) in STYLE.items():
         if m in skip:
             continue
@@ -43,10 +44,8 @@ def _lines(ax, rows, key, skip=()):
         if not pts:
             continue
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, color=c, marker=mk, lw=2, ms=6, markeredgecolor=SURFACE,
-                markeredgewidth=1.2, label=label, zorder=3)
-        ends.append((xs[-1], ys[-1], SHORT[m]))
-    _end_labels(ax, ends, gap_px=10)
+        ax.plot(xs, ys, color=c, marker=mk, lw=2, ms=7 if mk != "*" else 10,
+                markeredgecolor=SURFACE, markeredgewidth=1.0, label=label, zorder=3)
 
 
 def _axes_common(ax, photons, title, ylabel):
@@ -85,7 +84,7 @@ def realistic_figure(rows, out):
     handles, labels = axes.flat[0].get_legend_handles_labels()
     fig.suptitle("Realistic synthetic tissue: cells with sharp edges, tailed IRF (held-out pixels)",
                  x=0.01, ha="left", y=0.995, fontsize=11, color=INK, fontweight="bold")
-    fig.legend(handles, labels, loc="upper left", ncol=7, bbox_to_anchor=(0.005, 0.965), fontsize=8.5)
+    fig.legend(handles, labels, loc="upper left", ncol=8, bbox_to_anchor=(0.005, 0.965), fontsize=8.5)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(out, dpi=130)
     plt.close(fig)
@@ -108,8 +107,8 @@ def embryo_figure(rows, out):
     handles, labels = axes[0].get_legend_handles_labels()
     fig.suptitle("Zebrafish embryo, photons thinned from ~1250 per pixel (held-out pixels)", x=0.01,
                  ha="left", y=0.995, fontsize=11, color=INK, fontweight="bold")
-    fig.legend(handles, labels, loc="upper left", ncol=7, bbox_to_anchor=(0.005, 0.93), fontsize=8.5)
-    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    fig.legend(handles, labels, loc="upper left", ncol=4, bbox_to_anchor=(0.005, 0.95), fontsize=8.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.8))
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
@@ -122,7 +121,8 @@ def maps_figure(maps, tag, out, title, truth=None):
     y0, y1, x0, x1 = y.min(), y.max() + 1, x.min(), x.max() + 1
     panels = [("truth" if truth is not None else "MLE, all photons", ref)]
     panels += [(STYLE[m][2], maps[f"{tag}/{m}"]["tau_amp"]) for m in STYLE if f"{tag}/{m}" in maps]
-    fig, axes = plt.subplots(2, 4, figsize=(13, 6.8))
+    n = len(panels)
+    fig, axes = plt.subplots(2, (n + 1) // 2, figsize=(3.3 * ((n + 1) // 2), 6.8))
     for ax in axes.flat:
         ax.axis("off")
     for ax, (name, v) in zip(axes.flat, panels):
@@ -145,13 +145,16 @@ def main():
         realistic_figure(json.load(open(root / "realistic.json")), "docs/bench_realistic.png")
     if (root / "embryo.json").exists():
         embryo_figure(json.load(open(root / "embryo.json")), "docs/bench_embryo.png")
-    if (root / "realistic_maps.npy").exists():
-        maps = np.load(root / "realistic_maps.npy", allow_pickle=True).item()
+    maps_file = next((root / f for f in ("realistic_b_maps.npy", "realistic_maps.npy")
+                      if (root / f).exists()), None)
+    if maps_file is not None:
+        maps = np.load(maps_file, allow_pickle=True).item()
         gt = maps["grid"]["gt"]
         import torch
         from lumos_flim.predict import derived
         truth = derived(torch.as_tensor(1 / gt["gt_tau"]), torch.as_tensor(gt["gt_fraction"]))["tau_amp"].numpy()
-        tag = "realistic_p100" if "realistic_p100/vae" in maps else sorted(k.split("/")[0] for k in maps if "/" in k)[0]
+        tag = next((t for t in ("realistic_p250", "realistic_p100") if f"{t}/vae" in maps),
+                   sorted(k.split("/")[0] for k in maps if "/" in k)[0])
         maps_figure(maps, tag, "docs/bench_realistic_maps.png",
                     f"Mean lifetime maps, realistic tissue, {tag.split('_p')[1]} photons per pixel", truth)
     if (root / "embryo_maps.npy").exists():

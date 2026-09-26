@@ -8,6 +8,9 @@ fractions and a constant background), and the model produces the histogram.
 Training is unsupervised and uses the exact Poisson likelihood of photon
 counting.
 
+A full walk-through of the physics, every component and how each differs from
+lumos-vae is in [docs/how_it_works.md](docs/how_it_works.md).
+
 ## Why FLIM
 
 Of the candidates (FLIM, NMR T2 relaxometry, DOSY), FLIM is the closest match
@@ -338,6 +341,195 @@ independent check on the shape:
 
 ![embryo fits](docs/eval_embryo_fits.png)
 
+## Benchmark against stronger baselines
+
+`scripts/benchmark.py` runs eight methods on the same data, each fitted end to
+end with the IRF learned from the data:
+
+- the VAE, alone and with neighbourhood context (summed, or each neighbour
+  separately)
+- hierarchical empirical Bayes (EB): a Gaussian population prior fitted by
+  EM, the non-neural counterpart of what the VAE learns
+- TV-regularised MLE, with an edge-preserving spatial penalty whose strength
+  is chosen on held-out photons
+- 3x3 binned MLE
+- global lifetimes
+- per-pixel MLE
+
+Every pixel's photons are split at random: all methods fit one half and are
+scored on how well they predict the other. For Poisson data the halves are
+exactly two independent acquisitions, so this needs no ground truth. Scores
+are on val pixels, which the VAEs were not fitted on. One seed, 60 epochs,
+CPU.
+
+### Realistic synthetic tissue
+
+`synthetic.simulate_realistic` generates cell-like regions with sharp edges,
+their own lifetimes and fractions, empty regions and strongly varying
+brightness. Its IRF has an exponential diffusion tail on 25% of photons,
+which no method models by default. Ground truth is scored on non-empty
+pixels, with edge pixels separately.
+
+![realistic benchmark](docs/bench_realistic.png)
+
+| photons | method | held-out NLL above best (mnats/photon) | τ_amp bias / IQR / r | τ long r | α MAE | τ_amp IQR, edge / interior |
+|---|---|---|---|---|---|---|
+| 45 | VAE | 5.2 | +0.15 / 0.30 / 0.85 | 0.70 | 0.072 | 0.30 / 0.30 |
+| 45 | VAE + summed 3x3 | 4.7 | +0.15 / 0.25 / 0.87 | 0.70 | 0.068 | 0.22 / 0.26 |
+| 45 | VAE + stacked 3x3 | 5.1 | +0.15 / 0.27 / 0.86 | 0.70 | 0.068 | 0.22 / 0.28 |
+| 45 | empirical Bayes | 12.5 | -0.10 / 0.35 / 0.67 | 0.42 | 0.111 | 0.34 / 0.35 |
+| 45 | TV-regularised | 0.0 | -0.03 / 0.09 / 0.98 | 0.92 | 0.038 | 0.14 / 0.08 |
+| 45 | 3x3 binned | 3.7 | -0.07 / 0.26 / 0.81 | 0.67 | 0.064 | 0.29 / 0.25 |
+| 45 | global lifetimes | 14.6 | +0.15 / 0.32 / 0.82 | — | 0.122 | 0.35 / 0.32 |
+| 45 | per-pixel MLE | 24.5 | -0.12 / 0.57 / 0.61 | 0.31 | 0.148 | 0.55 / 0.57 |
+| 91 | VAE | 3.4 | +0.18 / 0.22 / 0.92 | 0.78 | 0.067 | 0.22 / 0.22 |
+| 91 | VAE + summed 3x3 | 3.5 | +0.19 / 0.22 / 0.92 | 0.79 | 0.064 | 0.26 / 0.22 |
+| 91 | VAE + stacked 3x3 | 3.4 | +0.19 / 0.21 / 0.92 | 0.79 | 0.058 | 0.19 / 0.21 |
+| 91 | empirical Bayes | 7.3 | -0.00 / 0.28 / 0.80 | 0.52 | 0.090 | 0.30 / 0.28 |
+| 91 | TV-regularised | 0.0 | +0.06 / 0.09 / 0.99 | 0.95 | 0.031 | 0.12 / 0.08 |
+| 91 | 3x3 binned | 2.1 | +0.04 / 0.16 / 0.91 | 0.73 | 0.051 | 0.26 / 0.15 |
+| 91 | global lifetimes | 7.8 | +0.18 / 0.26 / 0.90 | — | 0.117 | 0.30 / 0.25 |
+| 91 | per-pixel MLE | 12.9 | -0.00 / 0.40 / 0.73 | 0.39 | 0.108 | 0.40 / 0.40 |
+| 227 | VAE | 2.1 | +0.17 / 0.17 / 0.95 | 0.89 | 0.050 | 0.17 / 0.17 |
+| 227 | VAE + summed 3x3 | 2.1 | +0.15 / 0.18 / 0.95 | 0.89 | 0.046 | 0.17 / 0.18 |
+| 227 | VAE + stacked 3x3 | 2.1 | +0.17 / 0.18 / 0.95 | 0.89 | 0.051 | 0.15 / 0.18 |
+| 227 | empirical Bayes | 3.7 | +0.08 / 0.23 / 0.87 | 0.62 | 0.055 | 0.25 / 0.22 |
+| 227 | TV-regularised | 0.0 | +0.10 / 0.07 / 0.99 | 0.97 | 0.031 | 0.08 / 0.07 |
+| 227 | 3x3 binned | 1.5 | +0.10 / 0.11 / 0.95 | 0.84 | 0.042 | 0.25 / 0.10 |
+| 227 | global lifetimes | 4.2 | +0.17 / 0.20 / 0.93 | — | 0.101 | 0.19 / 0.20 |
+| 227 | per-pixel MLE | 5.4 | +0.08 / 0.25 / 0.83 | 0.47 | 0.078 | 0.26 / 0.25 |
+| 898 | VAE | 0.8 | +0.16 / 0.11 / 0.98 | 0.95 | 0.034 | 0.13 / 0.11 |
+| 898 | VAE + summed 3x3 | 0.7 | +0.16 / 0.10 / 0.98 | 0.95 | 0.037 | 0.11 / 0.10 |
+| 898 | VAE + stacked 3x3 | 0.7 | +0.16 / 0.12 / 0.98 | 0.95 | 0.035 | 0.12 / 0.11 |
+| 898 | empirical Bayes | 1.2 | +0.12 / 0.13 / 0.97 | 0.56 | 0.054 | 0.15 / 0.12 |
+| 898 | TV-regularised | 0.0 | +0.14 / 0.07 / 0.99 | 0.98 | 0.032 | 0.07 / 0.07 |
+| 898 | 3x3 binned | 1.3 | +0.14 / 0.06 / 0.97 | 0.92 | 0.037 | 0.24 / 0.05 |
+| 898 | global lifetimes | 2.3 | +0.17 / 0.15 / 0.97 | — | 0.101 | 0.18 / 0.15 |
+| 898 | per-pixel MLE | 1.4 | +0.13 / 0.14 / 0.95 | 0.74 | 0.054 | 0.17 / 0.14 |
+
+![realistic maps](docs/bench_realistic_maps.png)
+
+- **TV wins everything here, by a wide margin**: best held-out
+  likelihood, mean-lifetime IQR 0.07 to 0.09 against 0.10 to 0.30 for the
+  VAEs, and correlation with truth 0.98 or more at every level. But this
+  generator is piecewise constant, which is exactly TV's assumption, so it
+  flatters TV as much as the smooth generator flattered the VAE.
+- **On held-out photons the VAEs come third below 900 photons**, behind TV
+  and binning, and second at 900. They are well ahead of EB, global analysis
+  and per-pixel MLE. They keep sharp edges
+  without any spatial prior (edge and interior errors are similar), where
+  binning smears them.
+- **Neighbourhood context barely helps.** Summed or stacked, the spatial VAEs
+  are within noise of the plain VAE on every measure. An encoder that sees
+  its neighbours but is trained per pixel does not learn to pool them
+  effectively.
+- **Empirical Bayes is worse than the VAE** on held-out photons, correlation,
+  long lifetime and α at every level, though its mean-lifetime bias is
+  smaller from 91 photons up. A Gaussian prior in parameter space is too
+  crude for a population that is a mixture of regions; a nonlinear decoder
+  from a Gaussian latent represents that better.
+- **Every method's mean lifetime is biased high at 227 and 898 photons**
+  (+8 to +17%). That comes from the unmodelled IRF tail (next section). Per-pixel
+  MLE looked unbiased at 45 to 91 photons only because its low-count bias
+  (about −20%, seen on the smooth data) cancelled it.
+
+### Real tissue: zebrafish embryo
+
+The embryo image (9094 pixels of at least 1000 photons after 2x2 binning),
+thinned to 20%, 10% and 5% of its photons. Mean lifetimes are compared with
+per-pixel MLE on all the photons. That reference is itself noisy and
+low-count biased, and it flatters likelihood-maximising estimators; the
+held-out likelihood is the unbiased comparison.
+
+![embryo benchmark](docs/bench_embryo.png)
+
+| photons | method | held-out NLL above best (mnats/photon) | τ_amp vs full-photon MLE: median dev / IQR / r |
+|---|---|---|---|
+| 64 | VAE | 0.2 | +0.039 / 0.143 / 0.26 |
+| 64 | VAE + summed 3x3 | 0.0 | +0.040 / 0.146 / 0.23 |
+| 64 | VAE + stacked 3x3 | 0.7 | +0.043 / 0.158 / 0.26 |
+| 64 | empirical Bayes | 10.2 | -0.145 / 0.214 / 0.25 |
+| 64 | TV-regularised | 0.1 | -0.127 / 0.100 / 0.42 |
+| 64 | 3x3 binned | 3.7 | -0.128 / 0.171 / 0.32 |
+| 64 | global lifetimes | 13.8 | -0.015 / 0.197 / 0.25 |
+| 64 | per-pixel MLE | 25.9 | -0.121 / 0.384 / 0.26 |
+| 129 | VAE | 0.0 | +0.006 / 0.133 / 0.35 |
+| 129 | VAE + summed 3x3 | 0.0 | +0.007 / 0.132 / 0.36 |
+| 129 | VAE + stacked 3x3 | 0.0 | +0.005 / 0.132 / 0.34 |
+| 129 | empirical Bayes | 6.2 | -0.101 / 0.160 / 0.35 |
+| 129 | TV-regularised | 0.1 | -0.077 / 0.101 / 0.51 |
+| 129 | 3x3 binned | 1.7 | -0.081 / 0.132 / 0.40 |
+| 129 | global lifetimes | 6.9 | -0.003 / 0.152 / 0.32 |
+| 129 | per-pixel MLE | 13.7 | -0.098 / 0.280 / 0.37 |
+| 254 | VAE | 0.2 | -0.001 / 0.120 / 0.47 |
+| 254 | VAE + summed 3x3 | 0.2 | +0.003 / 0.122 / 0.45 |
+| 254 | VAE + stacked 3x3 | 0.2 | +0.004 / 0.124 / 0.42 |
+| 254 | empirical Bayes | 3.5 | -0.048 / 0.141 / 0.50 |
+| 254 | TV-regularised | 0.0 | -0.044 / 0.103 / 0.53 |
+| 254 | 3x3 binned | 0.8 | -0.044 / 0.121 / 0.49 |
+| 254 | global lifetimes | 3.0 | +0.005 / 0.137 / 0.38 |
+| 254 | per-pixel MLE | 6.3 | -0.047 / 0.188 / 0.53 |
+
+![embryo maps](docs/bench_embryo_maps.png)
+
+- **On held-out photons the best VAE and TV tie** at every level (within
+  0.2 millinats per photon), ahead of binning, EB, global analysis and per-pixel
+  MLE (26 millinats behind at 64 photons). TV's large synthetic lead does not
+  survive real tissue.
+- **The VAE's mean lifetime stays close to the full-photon reference** (+4%
+  at 64 photons, under 1% above that). TV, binning, EB and MLE all drift
+  short by 8 to 15% as photons drop, the usual low-count bias of maximising
+  the likelihood per pixel.
+- **TV tracks pixel-to-pixel variation better** (correlation 0.42 against
+  0.26 at 64 photons, IQR 0.10 against 0.14). The VAE is more accurate on
+  average but pulls individual pixels towards the population; TV keeps local
+  contrast but shifts the whole map. The maps show both: TV's is smooth and
+  uniformly light, the VAE's has the right tone and texture.
+
+### Modelling the IRF tail
+
+The realistic data's lifetime bias comes from its IRF tail, which a Gaussian
+IRF absorbs into the fluorescence: the short lifetime reads about 40% long.
+`--irf_tail` adds an exponential tail with a learned weight and rate
+(closed form, `docs/how_it_works.md` section 2.1b). At 100 photons, on the
+same split:
+
+| photons | method | IRF | held-out NLL (nats/photon) | τ_amp bias / IQR / r | τ short IQR | α MAE | fitted tail |
+|---|---|---|---|---|---|---|---|
+| 100 | MLE | gaussian | 3.2805 | -0.001 / 0.398 / 0.73 | 0.873 | 0.108 | — |
+| 100 | MLE | tailed | 3.2810 | -0.290 / 0.365 / 0.65 | 0.596 | 0.103 | — |
+| 100 | VAE | gaussian | 3.2710 | +0.184 / 0.223 / 0.92 | 0.461 | 0.067 | — |
+| 100 | VAE | tailed | 3.2709 | +0.100 / 0.210 / 0.92 | 0.322 | 0.056 | 12%, 0.29 ns |
+
+- **For the VAE the tail model nearly halves the mean-lifetime bias** (+18%
+  to +10%), cuts the short-lifetime spread by a third and lowers the α error.
+  It recovers a tail of 12% at 0.29 ns against the true 25% at 0.25 ns. A
+  tail on the IRF and a slightly longer short lifetime look much alike, so
+  the tail is only partly identifiable from the data.
+- **For per-pixel MLE the tail model exposes its low-count bias** (−29%),
+  confirming that its apparent accuracy with the Gaussian IRF was two errors
+  cancelling.
+- **Held-out likelihood is unchanged either way**, so photons alone cannot
+  tell the two IRF models apart at this count. A reference measurement of
+  the IRF would settle it.
+
+### Verdict
+
+Against strong baselines the VAE is a sound, competitive method but not a
+dominant one:
+
+- **On real tissue** it ties the best spatial method (TV) on predicting
+  unseen photons, and gives the least biased mean lifetimes at low counts.
+- **It beats per-pixel MLE, global analysis and a hierarchical-Bayes
+  population prior** by clear margins everywhere.
+- **When neighbouring pixels share parameters**, an explicit spatial prior
+  like TV recovers maps the VAE cannot, and showing the encoder its
+  neighbours does not close that gap.
+
+The obvious next step is to combine the two: amortised inference plus a
+spatial term in the objective, for example TV on the decoded parameters of
+neighbouring pixels in a batch of patches.
+
 ## A literal port of lumos-vae (removed)
 
 An earlier variant copied lumos-vae with only the physics changed: global
@@ -373,11 +565,13 @@ has been removed. What it showed:
 | `synthetic.py` | Photon-level simulator with ground truth |
 | `calibrate.py` | IRF from a reference dye of known lifetime |
 | `train.py`, `predict.py` | Training and inference, maps and per-image summaries |
-| `baseline.py` | Independent per-pixel MLE with the same physics, IRF optionally fitted |
+| `baseline.py` | Non-amortised fits of the same physics: per-pixel MLE, global, binned, TV, empirical Bayes |
 | `scripts/photon_sweep.py` | Synthetic sweep against per-pixel MLE and global analysis |
 | `scripts/thinning_study.py` | Real data at varying noise levels, scored on held-out photons |
 | `scripts/kl_study.py` | β = 1 ELBO against KL warm-up and free bits |
 | `scripts/plot_evaluation.py` | Evaluation figures |
+| `scripts/benchmark.py`, `scripts/plot_benchmark.py`, `scripts/summarise_benchmark.py` | Eight-method benchmark, figures and tables |
+| `scripts/irf_tail_study.py` | Gaussian against tailed IRF |
 
 Store layout: `counts [sample, channel, time]`, `split`, `image`, `y`, `x`,
 and `gt_*` for synthetic data. Attributes: `bin_width_ns`, `period_ns`,

@@ -66,6 +66,7 @@ class FlimModule(pl.LightningModule):
         lr_schedule: str = "cosine",
         spatial: int = 0,  # neighbourhood window for the encoder's context, 0 for none
         spatial_mode: str = "sum",  # "sum" of the neighbourhood, or "stack" each neighbour
+        irf_tail: bool = False,  # add a learned exponential tail to the Gaussian IRF
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -75,6 +76,7 @@ class FlimModule(pl.LightningModule):
             decoder_dim=decoder_dim, conv_channels=conv_channels, pool_time=pool_time,
             tau_max=tau_max, irf_t0=irf_t0, irf_sigma=irf_sigma, fix_irf=fix_irf,
             spatial=context_slots(spatial, spatial_mode) if spatial else 0,
+            irf_tail=irf_tail,
         )
         self.dof = n_channels * n_bins - n_free_parameters(n_components, n_channels)
 
@@ -129,6 +131,10 @@ class FlimModule(pl.LightningModule):
             if stage == "val":
                 self.log("irf_t0", self.model.irf_t0.detach(), prog_bar=True)
                 self.log("irf_sigma", self.model.irf_sigma.detach(), prog_bar=True)
+                w, q = self.model.irf_tail_params
+                if w is not None:
+                    self.log("irf_tail_weight", w.detach())
+                    self.log("irf_tail_tau", 1.0 / q.detach())
             if "gt_tau" in batch:
                 rel_tau, frac_err, bg_err = gt_errors(out, batch)
                 for i in range(rel_tau.shape[0]):

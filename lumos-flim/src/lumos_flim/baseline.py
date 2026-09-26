@@ -56,6 +56,10 @@ class PixelFitter:
         N = len(self.x)
         self.t0 = model.irf_t0.detach().to(d).clone()
         self.sigma_raw = model.irf_sigma_raw.detach().to(d).clone()
+        self.tail = getattr(model, "irf_tail", False)
+        if self.tail:
+            self.tail_logit = model.irf_tail_logit.detach().to(d).clone()
+            self.tail_rate_raw = model.irf_tail_rate_raw.detach().to(d).clone()
         self.bases = model.bases.detach().to(d) if model.bases is not None else None
         rate_bias = model.decoder.head_rate.bias.detach().to(d)
         frac_bias = model.decoder.head_fraction.bias.detach().to(d)
@@ -102,7 +106,10 @@ class PixelFitter:
         rates = (self.model.rate_min + torch.cumsum(F.softplus(rate_raw), -1)).expand(N, self.Fn)
         probs = F.softmax(frac_logits, -1)
         bg_spec = F.softmax(bg_logits, -1) if bg_logits is not None else None
-        decays = decay_histograms(rates, self.t0, self.sigma, self.model.n_bins, self.model.bin_width)
+        w = torch.sigmoid(self.tail_logit) if self.tail else None
+        q = F.softplus(self.tail_rate_raw) + 0.1 if self.tail else None
+        decays = decay_histograms(rates, self.t0, self.sigma, self.model.n_bins, self.model.bin_width,
+                                  tail_weight=w, tail_rate=q)
         mu = expected_counts(totals, probs[:, :-1], probs[:, -1], decays, self.bases, bg_spec)
         return rates, probs, mu
 
@@ -113,9 +120,10 @@ class PixelFitter:
         rest = self.rest.requires_grad_()
         params = [rates_raw, rest]
         if fit_irf:
-            self.t0.requires_grad_()
-            self.sigma_raw.requires_grad_()
-            params += [self.t0, self.sigma_raw]
+            irf = [self.t0, self.sigma_raw] + ([self.tail_logit, self.tail_rate_raw] if self.tail else [])
+            for p in irf:
+                p.requires_grad_()
+            params += irf
         opt = torch.optim.Adam(params, lr=lr)
         for _ in range(steps):
             opt.zero_grad()
@@ -126,7 +134,8 @@ class PixelFitter:
                 loss = loss + penalty(theta)
             loss.backward()
             opt.step()
-        for p in (self.rates_raw, self.rest, self.t0, self.sigma_raw):
+        for p in (self.rates_raw, self.rest, self.t0, self.sigma_raw) + (
+                (self.tail_logit, self.tail_rate_raw) if self.tail else ()):
             p.requires_grad_(False)
         return self
 
@@ -145,6 +154,9 @@ class PixelFitter:
     def copy_irf_from(self, other):
         self.t0 = other.t0.detach().clone()
         self.sigma_raw = other.sigma_raw.detach().clone()
+        if self.tail and other.tail:
+            self.tail_logit = other.tail_logit.detach().clone()
+            self.tail_rate_raw = other.tail_rate_raw.detach().clone()
         return self
 
 
@@ -348,6 +360,7 @@ def main(argv=None):
     p.add_argument("--n_components", type=int, default=2)
     p.add_argument("--fit_irf", action="store_true",
                    help="fit the IRF from the data, starting from its rising edge")
+    p.add_argument("--irf_tail", action="store_true", help="give the IRF a fitted exponential tail")
     p.add_argument("--global_lifetimes", action="store_true", help="same as --method global")
     p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda or mps")
@@ -369,7 +382,7 @@ def main(argv=None):
                         n_components=a.n_components, irf_t0=cal["irf_t0"], irf_sigma=cal["irf_sigma"])
     elif a.fit_irf:
         model = FlimVAE(n_bins=counts.shape[2], bin_width=meta["bin_width_ns"],
-                        n_components=a.n_components,
+                        n_components=a.n_components, irf_tail=a.irf_tail,
                         irf_t0=irf_t0_guess(counts, meta["bin_width_ns"]), irf_sigma=0.1)
     else:
         raise SystemExit("give --checkpoint, --irf or --fit_irf")

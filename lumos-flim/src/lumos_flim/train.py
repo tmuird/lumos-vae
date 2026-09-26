@@ -28,6 +28,7 @@ DEFAULTS = dict(
     irf="",  # JSON written by lumos_flim.calibrate
     irf_fit="fixed",  # which calibration fit: "fixed" (reference lifetime held) or "free"
     fix_irf=False,
+    irf_tail=False,  # learn an exponential diffusion tail on the Gaussian IRF
     # Model
     n_components=2,
     tau_max=0.0,  # longest lifetime in ns, 0 for one period
@@ -66,6 +67,8 @@ def make_run_name(cfg) -> str:
     if cfg["run_name"]:
         return cfg["run_name"]
     parts = [Path(cfg["data"]).stem, f"F{cfg['n_components']}", f"z{cfg['latent_dim']}"]
+    if cfg["irf_tail"]:
+        parts.append("tail")
     if cfg["spatial"]:
         parts.append(f"sp{cfg['spatial']}{cfg['spatial_mode'][0]}")
     if cfg["kl_warmup_epochs"]:
@@ -119,7 +122,7 @@ def train(cfg):
         learning_rate=cfg["learning_rate"], kl_weight=cfg["kl_weight"],
         kl_warmup_epochs=cfg["kl_warmup_epochs"], free_bits=cfg["free_bits"],
         max_epochs=cfg["max_epochs"], lr_schedule=cfg["lr_schedule"], spatial=cfg["spatial"],
-        spatial_mode=cfg["spatial_mode"],
+        spatial_mode=cfg["spatial_mode"], irf_tail=cfg["irf_tail"],
     )
 
     # Validate about every val_check_steps optimiser steps.

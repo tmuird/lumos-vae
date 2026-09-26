@@ -152,12 +152,42 @@ def decay_histograms(
     sigma: torch.Tensor,  # scalar or broadcastable to [..., F]
     n_bins: int,
     bin_width: float,
+    tail_weight: torch.Tensor = None,
+    tail_rate: torch.Tensor = None,
 ) -> torch.Tensor:
     """Probability that a photon from each component lands in each bin.
 
     Returns [..., F, n_bins]. Each row sums to one up to truncation of the
     Gaussian, which is negligible while ``sigma`` is well below the period.
+
+    With ``tail_weight`` w and ``tail_rate`` q the IRF is a Gaussian with an
+    exponential diffusion tail on a fraction w of photons, as single-photon
+    detectors show. A tail photon's delay is Exp(q) + Exp(k), whose density is
+    (q e^{-kt} - k e^{-qt}) k q / (q - k) / (k q), so its bin probabilities
+    are exactly (q p_k - k p_q) / (q - k) in terms of the Gaussian-IRF ones.
+    Periodicity and bin integration carry over by linearity.
     """
+    p = _gaussian_irf_decay(rates, t0, sigma, n_bins, bin_width)
+    if tail_weight is None:
+        return p
+    q = torch.as_tensor(tail_rate, dtype=rates.dtype, device=rates.device)
+    k = rates.unsqueeze(-1)
+    # tail = p_k - k (p_q - p_k) / (q - k). The divided difference is smooth
+    # but 0/0 at q = k, so within 2% it is replaced by a central difference
+    # at the midpoint of k and q, which is accurate to second order.
+    q = q.expand_as(k)
+    close = (q - k).abs() < 0.02 * k
+    mid = 0.5 * (q + k)
+    h = 0.01 * mid
+    a = torch.where(close, mid + h, q)
+    b = torch.where(close, mid - h, k)
+    p_a = _gaussian_irf_decay(a.squeeze(-1), t0, sigma, n_bins, bin_width)
+    p_b = _gaussian_irf_decay(b.squeeze(-1), t0, sigma, n_bins, bin_width)
+    tail = p - k * (p_a - p_b) / (a - b)
+    return ((1 - tail_weight) * p + tail_weight * tail).clamp(min=0.0)
+
+
+def _gaussian_irf_decay(rates, t0, sigma, n_bins, bin_width):
     period = n_bins * bin_width
     edges = bin_edges(n_bins, bin_width, device=rates.device, dtype=rates.dtype)
     k = rates.unsqueeze(-1)  # [..., F, 1]

@@ -168,6 +168,31 @@ explicitly. For j ≥ 2 the Gaussian part Φ(u_j) is 1 to machine precision
 part forms a geometric series in exp(−kP), summed in closed form as
 1/(1 − exp(−kP)).
 
+### 2.1b The IRF tail (optional, `--irf_tail`)
+
+Single-photon detectors add a slow diffusion tail to the IRF: a fraction w
+of photons is delayed by a further Exp(q). A tail photon's total delay beyond
+the Gaussian is then Exp(q) + Exp(k), the hypoexponential distribution.
+Its density is a difference of exponentials, so its bin probabilities are an
+exact linear combination of the Gaussian-IRF ones already computed:
+
+```
+p_tail(n) = (q · p_k(n) − k · p_q(n)) / (q − k)  =  p_k(n) − k · (p_q(n) − p_k(n)) / (q − k)
+p(n)      = (1 − w) · p_k(n) + w · p_tail(n)
+```
+
+Periodicity and bin integration carry over by linearity, and the rows still
+sum to one. The divided difference (p_q − p_k)/(q − k) is 0/0 when the tail
+rate equals a decay rate. Within 2% of that point it is replaced by a central
+difference at the midpoint of k and q, which is accurate to second order.
+Monte-Carlo tests cover the coincident case in float32 and float64. w and q
+are global parameters learned with the IRF (sigmoid and softplus).
+
+Why it matters: on the realistic benchmark, whose IRF has a 25% tail, the
+Gaussian-only model absorbs the tail's extra delay into the fluorescence. The
+short lifetime reads about 40% long and the mean lifetime about 19% long, for
+every method.
+
 ### 2.2 Numerics
 
 **Cancellation.** Written directly, exp(−k(t−t0) + k²σ²/2)·Φ(u − kσ)
@@ -277,6 +302,8 @@ between 1/span and 1/frame.
 
 - `n_bins`, `bin_width`, `period`: the time axis, from the store.
 - `rate_min`: section 3.
+- `irf_tail_logit`, `irf_tail_rate_raw` (with `irf_tail`): the tail's weight
+  and rate, section 2.1b.
 - `irf_t0`, `irf_sigma_raw`: the global IRF. σ = softplus(raw) + 5 ps, so it
   is positive and never exactly zero, which would make the physics a
   step function with undefined gradients. With `fix_irf` both are frozen,
@@ -334,9 +361,13 @@ convolution over [wavenumber, time] because it has 1024 spectral points; here
 spectral FLIM has a handful of channels, so treating them as input channels
 is simpler and loses nothing.
 
-**Spatial context** (`spatial=True`). The summed histogram of the k×k
-neighbourhood (excluding the centre) is added as further input channels,
-normalised the same way, with its own log total. Only the encoder sees it:
+**Spatial context** (`--spatial 3`). The neighbourhood enters as further
+input channels, normalised the same way, each with its own log total, in one
+of two forms. With `--spatial_mode sum` it is the summed histogram of the
+k×k neighbourhood excluding the centre. With `--spatial_mode stack` it is
+each of the k²−1 neighbours separately, zeros where a neighbour is missing.
+The sum loses which neighbour differs, so the encoder cannot tell an edge
+from noise. The stack keeps it. Only the encoder sees it:
 the likelihood is still that of the centre pixel alone, so the objective is
 still a valid ELBO for each pixel (any q(z | ·) gives a lower bound). Where
 neighbours agree, the encoder can borrow their photons; at an edge, it can
@@ -422,6 +453,9 @@ whatever learning rate it had reached.
 - `neighbourhood_sum`: k×k box sums by 2D cumulative sums over each image
   grid, with absent pixels as zero. It serves both the spatial encoder's
   context and the binned baseline. Checked against brute force.
+- `neighbour_stack`: each pixel's k²−1 neighbours as separate histograms,
+  for the stacked spatial encoder. `spatial_context` picks the sum or the
+  stack.
 - `neighbour_pairs`: the 4-connected neighbour pairs, for the TV baseline.
 - `PixelDataset`: tensors optionally placed on the GPU up front.
   `__getitems__` gathers a whole batch with one indexing call; per-pixel
@@ -588,12 +622,35 @@ held-out score is the unbiased one.
 
 ## 14. Known limitations
 
-- **Gaussian IRF.** Real IRFs have tails. The realistic benchmark measures
-  what this costs. A measured IRF, or an exponentially modified Gaussian IRF
-  (also closed form), would be the fix.
+- **IRF shape.** Gaussian by default, optionally with one exponential tail
+  (section 2.1b). A measured IRF would need a discrete convolution instead of
+  the closed form.
 - **One IRF per image.** Scanning systems can drift in t0 across the field.
 - **No pile-up or dead-time correction.** Fine at FLUTE's count rates.
 - **Two components by default.** Real samples may need three.
 - **Inference bias at very low counts on real tissue** (+7% τ_amp at 65
   photons on the embryo): the population prior leans towards the typical
   pixel.
+
+---
+
+## 15. How it performs
+
+Full tables and figures are in the README's "Benchmark against stronger
+baselines". In short:
+
+- **Real tissue (embryo, 64 to 254 photons per pixel).** The VAE ties the
+  best spatial method (TV) on predicting held-out photons and gives the least
+  biased mean lifetimes as photons drop (+4% at 64, where the
+  likelihood-maximising baselines drift 8 to 15% short). TV tracks
+  pixel-to-pixel variation better.
+- **Synthetic tissue with sharp-edged regions.** TV wins clearly, since the
+  data is piecewise constant, exactly its assumption. The VAE is ahead of
+  empirical Bayes, global analysis and per-pixel MLE, and keeps edges sharp
+  without a spatial prior.
+- **Neighbourhood context in the encoder** (summed or stacked) changes
+  little. Pooling across pixels would need a spatial term in the objective,
+  not just in the encoder's input.
+- **An unmodelled IRF tail** biases every method's mean lifetime upwards.
+  `--irf_tail` nearly halves this for the VAE, but the tail is only partly
+  identifiable from the photons alone.

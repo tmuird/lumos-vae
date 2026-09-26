@@ -168,6 +168,9 @@ def main(argv=None):
     module.cpu()
     m = module.model
     print(f"IRF: t0={m.irf_t0.item():.3f} ns sigma={m.irf_sigma.item():.3f} ns")
+    w, q = m.irf_tail_params
+    if w is not None:
+        print(f"IRF tail: {w.item():.1%} of photons, {1 / q.item():.3f} ns")
     if m.bases is not None:
         print("component spectra:\n", np.round(m.bases.detach().numpy(), 3))
     gt_report(result, ds)

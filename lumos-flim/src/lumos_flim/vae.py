@@ -41,6 +41,7 @@ class FlimVAE(nn.Module):
         irf_sigma: float = 0.1,
         fix_irf: bool = False,
         spatial: int = 0,  # number of context histograms per pixel, 0 for none
+        irf_tail: bool = False,
     ):
         super().__init__()
         self.spatial = spatial
@@ -58,6 +59,16 @@ class FlimVAE(nn.Module):
         self.irf_sigma_raw = nn.Parameter(
             torch.tensor(_inv_softplus(irf_sigma - _SIGMA_FLOOR)), requires_grad=not fix_irf
         )
+
+        # Optional exponential diffusion tail on the IRF: weight w (sigmoid)
+        # and rate q (softplus), shared by every pixel, learned with the rest.
+        # Starts at 10% of photons with a 0.3 ns tail.
+        self.irf_tail = irf_tail
+        if irf_tail:
+            self.irf_tail_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9)),
+                                               requires_grad=not fix_irf)
+            self.irf_tail_rate_raw = nn.Parameter(torch.tensor(_inv_softplus(1 / 0.3)),
+                                                  requires_grad=not fix_irf)
 
         if n_channels > 1:
             # Components start with distinct, broad spectra so they are not
@@ -92,6 +103,13 @@ class FlimVAE(nn.Module):
         return F.softplus(self.irf_sigma_raw) + _SIGMA_FLOOR
 
     @property
+    def irf_tail_params(self):
+        """(weight, rate) of the IRF tail, or (None, None) without one."""
+        if not getattr(self, "irf_tail", False):
+            return None, None
+        return torch.sigmoid(self.irf_tail_logit), F.softplus(self.irf_tail_rate_raw) + 0.1
+
+    @property
     def bases(self):
         """Emission spectrum of each component, [F, C], or None for one channel."""
         if self.basis_logits is None:
@@ -107,7 +125,9 @@ class FlimVAE(nn.Module):
         fractions, background = probs[:, :-1], probs[:, -1]
         bg_spectrum = F.softmax(bg_logits, dim=-1) if bg_logits is not None else None
 
-        decays = decay_histograms(rates, self.irf_t0, self.irf_sigma, self.n_bins, self.bin_width)
+        w, q = self.irf_tail_params
+        decays = decay_histograms(rates, self.irf_t0, self.irf_sigma, self.n_bins, self.bin_width,
+                                  tail_weight=w, tail_rate=q)
         expected = expected_counts(totals, fractions, background, decays, self.bases, bg_spectrum)
         return {
             "expected": expected,
