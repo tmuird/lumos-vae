@@ -182,6 +182,110 @@ cells. That could be biology, or the two lifetimes trading off, which a
 bi-exponential at ~800 photons is prone to. Lower `kl_weight` or fitting
 lifetimes globally with per-pixel fractions would help tell these apart.
 
+## Low-photon sweep
+
+`scripts/photon_sweep.py` simulates the same maps at 50 to 1000 photons per
+pixel. At each level it fits the direct per-pixel MLE (`baseline.py
+--fit_irf`), this VAE and the LUMOS port (`lumos_flim.lumos`, below), and
+scores the val pixels, which neither VAE was fitted on. Lifetime biases and
+IQRs are relative. α MAE is the absolute error in the long component's
+amplitude fraction. τ_amp is the amplitude-weighted mean lifetime, the number
+usually reported at low counts. The reconstruction error is the mean over bins
+of (μ̂ − μ_true)² / μ_true against the noise-free histogram; the raw
+measurement scores about 1 on it, so lower means denoised. One seed, 60
+epochs, CPU.
+
+| photons | method | τ long bias / IQR | τ short bias / IQR | α MAE | τ_amp bias / IQR | reconstruction error |
+|---|---|---|---|---|---|---|
+| 50 | raw data | | | | | 0.93 |
+| 50 | MLE | -0.03 / 0.46 | -0.35 / 1.16 | 0.187 | -0.27 / 0.59 | 0.037 |
+| 50 | VAE | +0.25 / 0.15 | -0.03 / 0.24 | 0.174 | -0.20 / 0.24 | 0.026 |
+| 50 | LUMOS port (ensemble) | +0.76 / 0.64 | +1.15 / 1.34 | 0.121 | +0.49 / 0.62 | 0.137 |
+| 100 | raw data | | | | | 0.94 |
+| 100 | MLE | -0.03 / 0.37 | -0.30 / 0.85 | 0.136 | -0.20 / 0.45 | 0.043 |
+| 100 | VAE | +0.25 / 0.14 | -0.05 / 0.24 | 0.156 | -0.17 / 0.21 | 0.040 |
+| 100 | LUMOS port (ensemble) | +0.66 / 0.53 | +1.26 / 1.22 | 0.118 | +0.43 / 0.45 | 0.102 |
+| 200 | raw data | | | | | 0.96 |
+| 200 | MLE | -0.04 / 0.31 | -0.26 / 0.71 | 0.091 | -0.16 / 0.36 | 0.049 |
+| 200 | VAE | +0.22 / 0.13 | -0.05 / 0.23 | 0.148 | -0.17 / 0.18 | 0.065 |
+| 200 | LUMOS port (ensemble) | +0.47 / 0.34 | +1.01 / 0.93 | 0.102 | +0.31 / 0.28 | 0.073 |
+| 500 | raw data | | | | | 0.96 |
+| 500 | MLE | -0.02 / 0.22 | -0.17 / 0.51 | 0.057 | -0.08 / 0.23 | 0.053 |
+| 500 | VAE | +0.14 / 0.11 | +0.00 / 0.18 | 0.088 | -0.07 / 0.14 | 0.057 |
+| 500 | LUMOS port (ensemble) | +0.63 / 0.35 | +1.54 / 1.12 | 0.170 | +0.37 / 0.22 | 0.105 |
+| 1000 | raw data | | | | | 0.97 |
+| 1000 | MLE | -0.02 / 0.17 | -0.09 / 0.39 | 0.042 | -0.04 / 0.16 | 0.055 |
+| 1000 | VAE | +0.07 / 0.08 | +0.05 / 0.16 | 0.042 | -0.01 / 0.10 | 0.036 |
+| 1000 | LUMOS port (ensemble) | -0.12 / 0.16 | +2.16 / 1.35 | 0.098 | +0.31 / 0.23 | 0.257 |
+
+What it shows:
+
+- **Denoising.** The VAE and MLE reconstruct the histogram 15 to 35 times
+  closer to the truth than the raw counts, because five
+  parameters per pixel cannot follow shot noise. The VAE and MLE are
+  comparable here (the VAE is ahead at 50, 100 and 1000 photons, behind at
+  200 and 500). This comes from the physics, not from amortisation.
+- **Mean lifetime.** τ_amp is where the VAE earns its keep. Its spread is 1.6
+  to 2.5 times tighter than MLE's at every photon level, with similar or
+  smaller bias. Both underestimate it by about 20% at 50 to 100 photons,
+  which looks like a limit of the information in the data, not of either
+  method.
+- **Short lifetime.** MLE's short lifetime collapses at low counts (−35% bias,
+  IQR 1.16 at 50 photons). The VAE's stays near unbiased with a fifth of the
+  spread.
+- **Long lifetime and α.** The VAE's long lifetime is biased high (+25% at
+  50 to 100 photons, +7% at 1000), where MLE is unbiased but two to three times
+  as spread. On α, MLE is better from 100 to 500 photons. Pooling across pixels
+  pulls both quantities towards the population, which is the shrinkage cost.
+- **The LUMOS port** is the worst of the three at every level. See below.
+
+Extrapolation is not used in the FLIM setting. TCSPC records every delay bin
+in parallel, so late bins cost nothing extra; what is scarce is photons.
+Fitting early bins and extrapolating the tail, which pays off in LUMOS where
+late frames cost time and bleaching, has no counterpart here, and all
+methods use the full period.
+
+## The LUMOS port
+
+`lumos_flim.lumos` is lumos-vae with only the physics swapped: the same 2D
+encoder with positional encodings, separate decoder trunks, unordered softplus
+rates, softplus abundances scaled by the dataset std, MoG bases, a learned
+heteroscedastic Gaussian noise model (α·μ + β), KL per element, an L1 on the
+static term, and a cosine schedule. The static Raman spectrum becomes a
+static background (one amplitude per channel), the bleaching exponential
+becomes the exact TCSPC bin probability, and the instrument blur becomes the
+Gaussian IRF.
+
+```bash
+python -m lumos_flim.lumos.train --data data/hmsc.zarr
+python -m lumos_flim.lumos.predict checkpoints/<run>/last.ckpt --data data/hmsc.zarr
+```
+
+It trains and fits, but recovers lifetimes poorly. What went wrong:
+
+- **The learned noise model is far off.** α starts at 0.018 and reaches only
+  0.03 in 60 epochs. The Poisson-correct value is 1/std, which is 0.61 at 50
+  photons. The model treats the data as about 20 times less noisy than it is,
+  and fits shot noise in bins that hold 0 to 2 photons, where a Gaussian is a
+  poor approximation to Poisson anyway.
+- **The latent collapses.** Of 64 latent dimensions, 63 match the prior. The
+  decoder is trained on samples from those dimensions, so decoding the
+  posterior mean (as the first sweep did) leaves its training distribution:
+  reconstruction MSE is 0.17 from the mean against 0.04 from samples. The
+  table scores the port with a 20-draw posterior ensemble (LUMOS's own
+  `sample_posterior` mode, `scripts/rescore_lumos.py`), which fixes the
+  reconstruction but not the lifetimes. The same mean-versus-sample gap is
+  worth checking in lumos-vae, whose `predict` decodes the mean when
+  `n_predictions=1`.
+- **Unordered rates** leave the slow component free to sit at the one-period
+  cap and imitate the background.
+
+`lumos_flim.vae` differs on each of those points. It uses the exact Poisson
+likelihood conditioned on the pixel total, per-pixel shape normalisation and
+ordered rates. Which of these carries most of the difference has not been
+isolated; swapping the Poisson likelihood into the port is the obvious first
+ablation.
+
 ## Layout
 
 | Module | Role |
@@ -194,7 +298,9 @@ lifetimes globally with per-pixel fractions would help tell these apart.
 | `synthetic.py` | Photon-level simulator with ground truth |
 | `calibrate.py` | IRF from a reference dye of known lifetime |
 | `train.py`, `predict.py` | Training and inference, maps and per-image summaries |
-| `baseline.py` | Independent per-pixel MLE with the same physics |
+| `baseline.py` | Independent per-pixel MLE with the same physics, IRF optionally fitted |
+| `lumos/` | lumos-vae ported with only the physics changed |
+| `scripts/photon_sweep.py`, `scripts/rescore_lumos.py` | Low-photon comparison of the three methods |
 
 Store layout: `counts [sample, channel, time]`, `split`, `image`, `y`, `x`,
 and `gt_*` for synthetic data. Attributes: `bin_width_ns`, `period_ns`,
