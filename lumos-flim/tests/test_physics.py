@@ -4,9 +4,9 @@ import torch
 
 from lumos_flim.physics import (
     amplitude_fractions,
-    erfcx,
-    log_ndtr,
-    ndtr,
+    erfcx_portable as erfcx,
+    log_ndtr_portable as log_ndtr,
+    ndtr_portable as ndtr,
     decay_histograms,
     expected_counts,
     irf_histogram,
@@ -94,7 +94,7 @@ def test_model_step(channels):
 
 
 def test_special_functions_match_torch():
-    # Built from elementary ops so they run on MPS; checked against torch.special.
+    # The portable versions used on MPS, checked against torch.special.
     x = torch.linspace(-37, 37, 20001, dtype=torch.float64)
     ref_log = torch.special.log_ndtr(x)
     assert (log_ndtr(x) - ref_log).abs().max() < 2e-7

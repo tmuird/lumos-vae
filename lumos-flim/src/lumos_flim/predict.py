@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from lumos_flim.data import SPLITS, open_store
+from lumos_flim.data import SPLITS, open_store, spatial_context
 from lumos_flim.device import pick_device
 from lumos_flim.physics import amplitude_fractions, mean_lifetimes
 from lumos_flim.vae_module import FlimModule, pearson_chi2
@@ -32,7 +32,7 @@ def derived(rates, fractions):
 
 
 @torch.no_grad()
-def run_model(module, counts, batch_size=4096, n_samples=20, seed=0, device="auto"):
+def run_model(module, counts, batch_size=4096, n_samples=20, seed=0, device="auto", context=None):
     """Per-pixel parameters from the posterior.
 
     With ``n_samples`` > 0 (the default, as in LUMOS's sample_posterior) each
@@ -40,8 +40,11 @@ def run_model(module, counts, batch_size=4096, n_samples=20, seed=0, device="aut
     deviation over the draws is returned as ``<name>_std``, and the
     reconstruction is the mean over draws. With 0 the posterior mean of the
     latent is decoded once. Runs on ``device`` ("auto" for CUDA, then MPS,
-    then CPU); results come back as numpy on the host.
+    then CPU); results come back as numpy on the host. A spatial model needs
+    ``context``, from ``data.spatial_context`` with the model's window and mode.
     """
+    if module.hparams.get("spatial", 0) and context is None:
+        raise ValueError("spatial model: pass context=spatial_context(...)")
     torch.manual_seed(seed)
     device = pick_device(device)
     model = module.model.to(device).eval()
@@ -51,7 +54,10 @@ def run_model(module, counts, batch_size=4096, n_samples=20, seed=0, device="aut
     recon = []
     for start in range(0, len(counts), batch_size):
         x = torch.as_tensor(counts[start:start + batch_size], dtype=torch.float32, device=device)
-        draws = [model(x, sample=True) for _ in range(n_samples)] if n_samples else [model(x, sample=False)]
+        ctx = (torch.as_tensor(context[start:start + batch_size], dtype=torch.float32, device=device)
+               if context is not None else None)
+        draws = ([model(x, sample=True, context=ctx) for _ in range(n_samples)] if n_samples
+                 else [model(x, sample=False, context=ctx)])
         draws = [{k: v.cpu() for k, v in r.items() if v is not None} for r in draws]
         x = x.cpu()
         vals = [dict(derived(r["rates"], r["fractions"]), fractions=r["fractions"],
@@ -153,7 +159,12 @@ def main(argv=None):
 
     module = FlimModule.load_from_checkpoint(a.checkpoint, map_location="cpu")
     ds, meta = open_store(a.data)
-    result = run_model(module, ds["counts"].values, n_samples=a.n_samples, device=a.device)
+    k = module.hparams.get("spatial", 0)
+    mode = module.hparams.get("spatial_mode", "sum")
+    context = (spatial_context(ds["counts"].values, ds["image"].values, ds["y"].values,
+                               ds["x"].values, meta["image_shapes"], k, mode) if k else None)
+    result = run_model(module, ds["counts"].values, n_samples=a.n_samples, device=a.device,
+                       context=context)
     module.cpu()
     m = module.model
     print(f"IRF: t0={m.irf_t0.item():.3f} ns sigma={m.irf_sigma.item():.3f} ns")

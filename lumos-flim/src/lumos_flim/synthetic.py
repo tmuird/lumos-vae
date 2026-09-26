@@ -92,12 +92,97 @@ def simulate(
     return counts, bin_width, yy, xx, gt, bases
 
 
+def simulate_realistic(
+    size=96,
+    n_bins=56,
+    period=12.483,
+    photons=1000,
+    n_regions=30,
+    empty_fraction=0.2,
+    irf_t0=1.0,
+    irf_sigma=0.10,
+    irf_tail_weight=0.25,
+    irf_tail_tau=0.25,
+    seed=0,
+):
+    """A harder, more tissue-like image, single channel.
+
+    - Cell-like regions (a Voronoi partition), each with its own lifetimes and
+      bound fraction, gentle variation inside and sharp edges between, so
+      methods that smooth across neighbours are penalised at boundaries.
+    - Some regions are near-empty background, and brightness varies strongly
+      between regions.
+    - NADH-like lifetimes: bound 1.8-3.4 ns, free 0.35-0.55 ns.
+    - The IRF has an exponential diffusion tail on a quarter of the photons,
+      as single-photon detectors do. Every method here fits a pure Gaussian
+      IRF, so all of them are misspecified in the same way real data is.
+    """
+    rng = np.random.default_rng(seed)
+    shape = (size, size)
+    n_pix = size * size
+    yy, xx = np.divmod(np.arange(n_pix), size)
+
+    seeds = rng.uniform(0, size, (n_regions, 2))
+    d2 = (yy[:, None] - seeds[None, :, 0]) ** 2 + (xx[:, None] - seeds[None, :, 1]) ** 2
+    region = d2.argmin(1)
+    empty = rng.random(n_regions) < empty_fraction
+
+    def per_region(lo, hi, wobble):
+        base = rng.uniform(lo, hi, n_regions)[region]
+        return base * (1 + wobble * (smooth_field(rng, shape, lo=-1, hi=1).ravel()))
+
+    tau = np.stack([per_region(1.8, 3.4, 0.05), per_region(0.35, 0.55, 0.05)], axis=1)
+    alpha = np.clip(per_region(0.1, 0.6, 0.1), 0.02, 0.98)
+    amp = np.stack([alpha, 1 - alpha], axis=1)
+    photon_frac = amp * tau / (amp * tau).sum(1, keepdims=True)
+    bg = smooth_field(rng, shape, lo=0.01, hi=0.04).ravel()
+    probs = np.concatenate([photon_frac * (1 - bg[:, None]), bg[:, None]], axis=1)
+
+    level = np.where(empty, 0.15, rng.lognormal(0.0, 0.4, n_regions))[region]
+    intensity = level * smooth_field(rng, shape, lo=0.6, hi=1.4).ravel()
+    intensity *= 1.0 / np.median(intensity[~empty[region]])
+    totals = rng.poisson(photons * intensity)
+    per_source = rng.multinomial(totals, probs)
+
+    bin_width = period / n_bins
+    counts = np.zeros(n_pix * n_bins, dtype=np.int64)
+    for src in range(3):
+        pix = np.repeat(np.arange(n_pix), per_source[:, src])
+        if src < 2:
+            t = rng.normal(irf_t0, irf_sigma, pix.size) + rng.exponential(tau[pix, src])
+            tail = rng.random(pix.size) < irf_tail_weight
+            t[tail] += rng.exponential(irf_tail_tau, tail.sum())
+        else:
+            t = rng.uniform(0, period, pix.size)
+        b = np.floor(np.mod(t, period) / bin_width).astype(np.int64).clip(0, n_bins - 1)
+        np.add.at(counts, pix * n_bins + b, 1)
+    counts = counts.reshape(n_pix, 1, n_bins)
+
+    grid = region.reshape(shape)
+    edge = np.zeros(shape, bool)
+    edge[1:, :] |= grid[1:, :] != grid[:-1, :]
+    edge[:-1, :] |= grid[:-1, :] != grid[1:, :]
+    edge[:, 1:] |= grid[:, 1:] != grid[:, :-1]
+    edge[:, :-1] |= grid[:, :-1] != grid[:, 1:]
+    gt = {
+        "gt_tau": tau,
+        "gt_fraction": probs[:, :2],
+        "gt_background": bg,
+        "gt_alpha": amp,
+        "gt_boundary": edge.ravel().astype(np.float32),
+        "gt_empty": empty[region].astype(np.float32),
+    }
+    return counts, bin_width, yy, xx, gt, np.ones((2, 1))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", required=True)
     p.add_argument("--size", type=int, default=96)
     p.add_argument("--photons", type=float, default=1000, help="median photons per pixel")
     p.add_argument("--channels", type=int, default=1)
+    p.add_argument("--realistic", action="store_true",
+                   help="cell-like regions with sharp edges and a tailed IRF (single channel)")
     p.add_argument("--irf_t0", type=float, default=1.0)
     p.add_argument("--irf_sigma", type=float, default=0.12)
     p.add_argument("--val_frac", type=float, default=0.1)
@@ -105,15 +190,21 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(argv)
 
-    counts, bin_width, yy, xx, gt, bases = simulate(
-        size=a.size, photons=a.photons, n_channels=a.channels,
-        irf_t0=a.irf_t0, irf_sigma=a.irf_sigma, seed=a.seed,
-    )
+    if a.realistic:
+        counts, bin_width, yy, xx, gt, bases = simulate_realistic(
+            size=a.size, photons=a.photons, irf_t0=a.irf_t0, seed=a.seed)
+    else:
+        counts, bin_width, yy, xx, gt, bases = simulate(
+            size=a.size, photons=a.photons, n_channels=a.channels,
+            irf_t0=a.irf_t0, irf_sigma=a.irf_sigma, seed=a.seed,
+        )
     split = assign_splits(len(counts), a.val_frac, a.test_frac, a.seed)
     write_store(
         a.out, counts, bin_width, np.zeros(len(counts)), yy, xx,
         ["synthetic"], [(a.size, a.size)], split, gt=gt,
-        attrs=dict(source="synthetic", gt_irf_t0=a.irf_t0, gt_irf_sigma=a.irf_sigma,
+        attrs=dict(source="synthetic-realistic" if a.realistic else "synthetic",
+                   gt_irf_t0=a.irf_t0, gt_irf_sigma=0.10 if a.realistic else a.irf_sigma,
+                   gt_irf_tail=[0.25, 0.25] if a.realistic else [0.0, 0.0],
                    gt_bases=bases.tolist()),
     )
     print(f"wrote {a.out}: {counts.shape}, median {np.median(counts.sum((1, 2))):.0f} photons/pixel")

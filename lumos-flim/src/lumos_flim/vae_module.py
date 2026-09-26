@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 
+from lumos_flim.data import context_slots
 from lumos_flim.vae import FlimVAE
 
 
@@ -63,6 +64,8 @@ class FlimModule(pl.LightningModule):
         free_bits: float = 0.0,
         max_epochs: int = 100,
         lr_schedule: str = "cosine",
+        spatial: int = 0,  # neighbourhood window for the encoder's context, 0 for none
+        spatial_mode: str = "sum",  # "sum" of the neighbourhood, or "stack" each neighbour
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -71,6 +74,7 @@ class FlimModule(pl.LightningModule):
             n_components=n_components, latent_dim=latent_dim, hidden_dim=hidden_dim,
             decoder_dim=decoder_dim, conv_channels=conv_channels, pool_time=pool_time,
             tau_max=tau_max, irf_t0=irf_t0, irf_sigma=irf_sigma, fix_irf=fix_irf,
+            spatial=context_slots(spatial, spatial_mode) if spatial else 0,
         )
         self.dof = n_channels * n_bins - n_free_parameters(n_components, n_channels)
 
@@ -86,7 +90,7 @@ class FlimModule(pl.LightningModule):
 
     def _step(self, batch, stage):
         x = batch["x"]
-        out = self.model(x)
+        out = self.model(x, context=batch.get("context"))
         recon = poisson_half_deviance(x, out["expected"])
         mu, logvar = out["mu"], out["logvar"]
         kl_dims = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # [B, D]

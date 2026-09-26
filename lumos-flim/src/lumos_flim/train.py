@@ -35,6 +35,8 @@ DEFAULTS = dict(
     hidden_dim=128,
     decoder_dim=128,
     conv_channels="32,64,128",
+    spatial=0,  # encoder also sees the k x k neighbourhood (e.g. 3); 0 for none
+    spatial_mode="sum",  # "sum": one summed context histogram; "stack": each neighbour separately
     # Objective. beta = 1 is the ELBO; warm-up ramps up to it and free bits
     # departs from it, so both are off by default.
     kl_weight=1.0,
@@ -64,6 +66,8 @@ def make_run_name(cfg) -> str:
     if cfg["run_name"]:
         return cfg["run_name"]
     parts = [Path(cfg["data"]).stem, f"F{cfg['n_components']}", f"z{cfg['latent_dim']}"]
+    if cfg["spatial"]:
+        parts.append(f"sp{cfg['spatial']}{cfg['spatial_mode'][0]}")
     if cfg["kl_warmup_epochs"]:
         parts.append(f"warm{cfg['kl_warmup_epochs']}")
     if cfg["free_bits"]:
@@ -81,7 +85,8 @@ def train(cfg):
     preload = device if cfg["preload"] and device.type != "cpu" else None
     print(f"training on {device}")
     dm = FlimDataModule(cfg["data"], batch_size=cfg["batch_size"], transductive=cfg["transductive"],
-                        preload_device=preload)
+                        preload_device=preload, spatial=cfg["spatial"],
+                        spatial_mode=cfg["spatial_mode"])
     dm.setup()
 
     irf_t0, irf_sigma = dm.irf_t0_guess, 0.1
@@ -113,7 +118,8 @@ def train(cfg):
         irf_t0=irf_t0, irf_sigma=irf_sigma, fix_irf=cfg["fix_irf"],
         learning_rate=cfg["learning_rate"], kl_weight=cfg["kl_weight"],
         kl_warmup_epochs=cfg["kl_warmup_epochs"], free_bits=cfg["free_bits"],
-        max_epochs=cfg["max_epochs"], lr_schedule=cfg["lr_schedule"],
+        max_epochs=cfg["max_epochs"], lr_schedule=cfg["lr_schedule"], spatial=cfg["spatial"],
+        spatial_mode=cfg["spatial_mode"],
     )
 
     # Validate about every val_check_steps optimiser steps.

@@ -42,11 +42,37 @@ _LOG_HALF = math.log(0.5)
 _SQRT_HALF = math.sqrt(0.5)
 
 
-# The special functions are built from elementary operations so the model
-# runs unchanged on CPU, CUDA and Apple's MPS, which lacks kernels for
-# torch.special.erfcx and log_ndtr.
+# Apple's MPS has no kernels for torch.special.erfcx or log_ndtr, so these
+# are also built from elementary operations. The native kernels are faster,
+# so they are used wherever they exist and the portable versions only on MPS.
+
+def _portable(x):
+    return x.device.type == "mps"
+
 
 def erfcx(x):
+    """exp(x^2) erfc(x) for x >= 0; negative inputs are clamped to zero."""
+    if not _portable(x):
+        return torch.special.erfcx(x.clamp(min=0.0))
+    return erfcx_portable(x)
+
+
+def log_ndtr(x):
+    """log of the standard normal CDF, accurate far into both tails."""
+    if not _portable(x):
+        return torch.special.log_ndtr(x)
+    return log_ndtr_portable(x)
+
+
+def ndtr(x):
+    """Standard normal CDF, via log_ndtr in the lower tail where the native
+    ndtr underflows."""
+    if not _portable(x):
+        return torch.where(x < 0, torch.exp(torch.special.log_ndtr(x)), torch.special.ndtr(x))
+    return ndtr_portable(x)
+
+
+def erfcx_portable(x):
     """Scaled complementary error function exp(x^2) erfc(x), for x >= 0.
 
     Chebyshev fit from Numerical Recipes (erfcc), fractional error below
@@ -54,22 +80,22 @@ def erfcx(x):
     clamped to zero; callers only need the non-negative branch.
     """
     x = x.clamp(min=0.0)
-    t = 1.0 / (1.0 + 0.5 * x)
+    t = 1.0 / (1.0 + 0.5 * x)  # erfcx from elementary operations
     poly = -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (
         -0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (
             -0.82215223 + t * 0.17087277))))))))
     return t * torch.exp(poly)
 
 
-def log_ndtr(x):
-    """log of the standard normal CDF, accurate far into both tails."""
+def log_ndtr_portable(x):
+    """log of the standard normal CDF from elementary operations."""
     z = x.abs() * _SQRT_HALF
     log_tail = _LOG_HALF + torch.log(erfcx(z)) - z**2  # log Phi(-|x|)
     return torch.where(x < 0, log_tail, torch.log1p(-torch.exp(log_tail)))
 
 
-def ndtr(x):
-    """Standard normal CDF."""
+def ndtr_portable(x):
+    """Standard normal CDF from elementary operations."""
     z = x.abs() * _SQRT_HALF
     tail = 0.5 * erfcx(z) * torch.exp(-z**2)  # Phi(-|x|)
     return torch.where(x < 0, tail, 1.0 - tail)

@@ -40,8 +40,10 @@ class FlimVAE(nn.Module):
         irf_t0: float = 1.0,
         irf_sigma: float = 0.1,
         fix_irf: bool = False,
+        spatial: int = 0,  # number of context histograms per pixel, 0 for none
     ):
         super().__init__()
+        self.spatial = spatial
         self.n_bins = n_bins
         self.bin_width = float(bin_width)
         self.period = n_bins * self.bin_width
@@ -68,7 +70,8 @@ class FlimVAE(nn.Module):
 
         if isinstance(conv_channels, str):
             conv_channels = tuple(int(v) for v in conv_channels.split(","))
-        self.encoder = Encoder(n_channels, n_bins, hidden_dim, latent_dim, conv_channels, pool_time)
+        self.encoder = Encoder(n_channels, n_bins, hidden_dim, latent_dim, conv_channels, pool_time,
+                               spatial=spatial)
         self.decoder = Decoder(latent_dim, decoder_dim, n_components, n_channels)
 
         # Rates start log-spaced across what the window can resolve: from a
@@ -114,10 +117,13 @@ class FlimVAE(nn.Module):
             "background_spectrum": bg_spectrum,
         }
 
-    def forward(self, x, sample=None, scale=1.0):
-        # x: [B, C, N] raw photon counts
+    def forward(self, x, sample=None, scale=1.0, context=None):
+        # x: [B, C, N] raw photon counts. context: [B, M, C, N], the
+        # neighbourhood histograms, when the encoder is spatial.
         totals = x.sum(dim=(1, 2)).clamp(min=1.0)
-        mu, logvar = self.encoder(x, totals)
+        if self.spatial and context is None:
+            raise ValueError("spatial model needs the neighbourhood context")
+        mu, logvar = self.encoder(x, totals, context if self.spatial else None)
         if sample is None:
             sample = self.training
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar) * scale if sample else mu
@@ -134,16 +140,25 @@ class Encoder(nn.Module):
     Counts are divided by the pixel total, which varies by orders of magnitude
     across an image, and the log total is passed alongside so the encoder still
     knows how noisy the pixel is.
+
+    With ``spatial`` = M the M context histograms (the summed neighbourhood,
+    or each neighbour separately) come in as further input channels, each
+    normalised the same way, with their log totals. They only inform the
+    encoder: the likelihood is still that of the centre pixel alone. Empty
+    neighbours (outside the image or dropped as too dim) arrive as zeros with
+    log total 0, which the encoder can learn to ignore.
     """
 
-    def __init__(self, n_channels, n_bins, hidden_dim, latent_dim, conv_channels, pool_time):
+    def __init__(self, n_channels, n_bins, hidden_dim, latent_dim, conv_channels, pool_time,
+                 spatial=False):
         super().__init__()
         phase = 2 * math.pi * torch.arange(n_bins) / n_bins
         self.register_buffer("phase", torch.stack([phase.cos(), phase.sin()]))  # [2, N]
         self.n_bins = n_bins
         self.pool_time = pool_time
+        self.spatial = spatial
 
-        layers, c_in = [], n_channels + 2
+        layers, c_in = [], n_channels * (1 + spatial) + 2
         for i, c_out in enumerate(conv_channels):
             layers += [
                 nn.Conv1d(c_in, c_out, kernel_size=5, padding=2, padding_mode="circular",
@@ -152,7 +167,8 @@ class Encoder(nn.Module):
             ]
             c_in = c_out
         self.conv = nn.Sequential(*layers)
-        self.fc = nn.Sequential(nn.Linear(c_in * pool_time + 1, hidden_dim), nn.LeakyReLU(0.2))
+        n_scalars = 1 + spatial
+        self.fc = nn.Sequential(nn.Linear(c_in * pool_time + n_scalars, hidden_dim), nn.LeakyReLU(0.2))
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
@@ -161,13 +177,26 @@ class Encoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity="leaky_relu")
                 nn.init.zeros_(m.bias)
 
-    def forward(self, x, totals):
-        B, C, N = x.shape
-        shape = x * (C * N) / totals[:, None, None]  # mean one
+    @staticmethod
+    def _shape(x):
+        """Histogram scaled to mean one, and its log total."""
+        C, N = x.shape[1:]
+        total = x.sum(dim=(1, 2)).clamp(min=1.0)
+        return x * (C * N) / total[:, None, None], total.log().unsqueeze(1)
+
+    def forward(self, x, totals, context=None):
+        B = x.shape[0]
+        shape, log_total = self._shape(x)
+        channels, scalars = [shape], [log_total]
+        if self.spatial:
+            M = context.shape[1]
+            ctx_shape, ctx_log_total = self._shape(context.flatten(0, 1))
+            channels.append(ctx_shape.view(B, M * ctx_shape.shape[1], -1))
+            scalars.append(ctx_log_total.view(B, M))
         pe = self.phase.unsqueeze(0).expand(B, -1, -1)
-        h = self.conv(torch.cat([shape, pe], dim=1))
+        h = self.conv(torch.cat(channels + [pe], dim=1))
         h = F.adaptive_avg_pool1d(h, self.pool_time).flatten(1)
-        h = self.fc(torch.cat([h, totals.log().unsqueeze(1)], dim=1))
+        h = self.fc(torch.cat([h] + scalars, dim=1))
         return self.fc_mu(h), self.fc_logvar(h).clamp(-20.0, 10.0)
 
 

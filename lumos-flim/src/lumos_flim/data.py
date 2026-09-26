@@ -8,6 +8,7 @@ Store layout, one row per pixel (after any spatial binning):
     y, x        [sample]                 pixel position in that image
     gt_tau, gt_fraction [sample, component], gt_background [sample]
                                          synthetic data only, never used in a loss
+    gt_boundary [sample]                 realistic synthetic data: pixel on a region edge
 
 Attributes: ``bin_width_ns``, ``period_ns``, ``image_names``, ``image_shapes``.
 """
@@ -115,6 +116,78 @@ def open_store(path):
     return ds, meta
 
 
+def _dense(counts, image, y, x, shapes):
+    """Scatter pixel rows back onto their image grids, zeros where no pixel."""
+    grids = [np.zeros((h, w) + counts.shape[1:], dtype=np.float64) for h, w in shapes]
+    for i, g in enumerate(grids):
+        m = image == i
+        g[y[m], x[m]] = counts[m]
+    return grids
+
+
+def neighbourhood_sum(counts, image, y, x, shapes, k: int = 3, include_centre: bool = False):
+    """Sum of each pixel's k x k neighbourhood, [N, C, T].
+
+    Pixels absent from the store (dropped as too dim) count as zero. With
+    ``include_centre`` this is the usual binned histogram; without it, the
+    context the spatial encoder sees alongside the pixel itself.
+    """
+    r = k // 2
+    out = np.zeros(counts.shape, dtype=np.float64)
+    for i, g in enumerate(_dense(counts, image, y, x, shapes)):
+        # Box sum via a 2D cumulative sum over a zero-padded grid.
+        pad = np.pad(g, ((r + 1, r), (r + 1, r)) + ((0, 0),) * (g.ndim - 2))
+        cs = pad.cumsum(0).cumsum(1)
+        box = cs[k:, k:] - cs[:-k, k:] - cs[k:, :-k] + cs[:-k, :-k]
+        m = image == i
+        out[m] = box[y[m], x[m]]
+    if not include_centre:
+        out -= counts
+    return out
+
+
+def neighbour_stack(counts, image, y, x, shapes, k: int = 3):
+    """Each pixel's k x k neighbours as separate histograms, [N, k*k - 1, C, T].
+
+    Unlike ``neighbourhood_sum`` this keeps which neighbour is which, so an
+    encoder can tell a neighbour across an edge from one that agrees.
+    Neighbours outside the image or absent from the store are zeros.
+    """
+    r = k // 2
+    offsets = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1) if (dy, dx) != (0, 0)]
+    out = np.zeros((len(counts), len(offsets)) + counts.shape[1:], dtype=np.float32)
+    for i, g in enumerate(_dense(counts, image, y, x, shapes)):
+        m = image == i
+        pad = np.pad(g, ((r, r), (r, r)) + ((0, 0),) * (g.ndim - 2))
+        for j, (dy, dx) in enumerate(offsets):
+            out[m, j] = pad[y[m] + r + dy, x[m] + r + dx]
+    return out
+
+
+def spatial_context(counts, image, y, x, shapes, k: int, mode: str = "sum"):
+    """Encoder context, [N, M, C, T]: the summed neighbourhood (M = 1) or the
+    neighbours stacked individually (M = k*k - 1)."""
+    if mode == "stack":
+        return neighbour_stack(counts, image, y, x, shapes, k)
+    return neighbourhood_sum(counts, image, y, x, shapes, k)[:, None].astype(np.float32)
+
+
+def context_slots(k: int, mode: str) -> int:
+    return k * k - 1 if mode == "stack" else 1
+
+
+def neighbour_pairs(image, y, x):
+    """Index pairs (i, j) of 4-connected neighbours present in the store."""
+    key = {(int(im), int(a), int(b)): n for n, (im, a, b) in enumerate(zip(image, y, x))}
+    pairs = []
+    for n, (im, a, b) in enumerate(zip(image, y, x)):
+        for da, db in ((1, 0), (0, 1)):
+            j = key.get((int(im), int(a) + da, int(b) + db))
+            if j is not None:
+                pairs.append((n, j))
+    return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+
+
 def irf_t0_guess(counts, bin_width: float) -> float:
     """Pulse arrival guessed from the steepest rise of the summed histogram."""
     h = np.asarray(counts).reshape(-1, counts.shape[-1]).sum(0)
@@ -129,8 +202,10 @@ class PixelDataset(Dataset):
     per pixel, which matters once the tensors live on a GPU.
     """
 
-    def __init__(self, counts, gt: Optional[dict] = None, device=None):
+    def __init__(self, counts, gt: Optional[dict] = None, device=None, context=None):
         self.counts = torch.as_tensor(counts, dtype=torch.float32, device=device)
+        self.context = (torch.as_tensor(context, dtype=torch.float32, device=device)
+                        if context is not None else None)
         self.gt = {k: torch.as_tensor(v, dtype=torch.float32, device=device)
                    for k, v in (gt or {}).items()}
 
@@ -143,6 +218,8 @@ class PixelDataset(Dataset):
     def __getitems__(self, indices):
         idx = torch.as_tensor(indices, device=self.counts.device)
         batch = {"x": self.counts[idx], "index": idx}
+        if self.context is not None:
+            batch["context"] = self.context[idx]
         for k, v in self.gt.items():
             batch[k] = v[idx]
         return batch
@@ -162,8 +239,13 @@ class FlimDataModule(pl.LightningDataModule):
     """
 
     def __init__(self, path, batch_size: int = 512, transductive: bool = True,
-                 num_workers: int = 0, preload_device=None):
+                 num_workers: int = 0, preload_device=None, spatial: int = 0,
+                 spatial_mode: str = "sum"):
         super().__init__()
+        # Neighbourhood size for the spatial encoder's context, 0 for none,
+        # and whether the neighbours are summed or kept separate.
+        self.spatial = spatial
+        self.spatial_mode = spatial_mode
         self.path = path
         self.batch_size = batch_size
         self.transductive = transductive
@@ -186,8 +268,13 @@ class FlimDataModule(pl.LightningDataModule):
         fit = split != SPLITS["val"] if self.transductive else split == SPLITS["train"]
         val = split == SPLITS["val"]
         dev = self.preload_device
-        self.train_ds = PixelDataset(counts[fit], {k: v[fit] for k, v in gt.items()}, dev)
-        self.val_ds = PixelDataset(counts[val], {k: v[val] for k, v in gt.items()}, dev)
+        ctx = None
+        if self.spatial:
+            ctx = spatial_context(counts, ds["image"].values, ds["y"].values, ds["x"].values,
+                                  meta["image_shapes"], self.spatial, self.spatial_mode)
+        pick = lambda m: None if ctx is None else ctx[m]  # noqa: E731
+        self.train_ds = PixelDataset(counts[fit], {k: v[fit] for k, v in gt.items()}, dev, pick(fit))
+        self.val_ds = PixelDataset(counts[val], {k: v[val] for k, v in gt.items()}, dev, pick(val))
         self.irf_t0_guess = irf_t0_guess(counts[fit], self.bin_width)
         print(f"FlimDataModule: {len(self.train_ds)} fit, {len(self.val_ds)} val pixels, "
               f"{self.n_channels} channel(s) x {self.n_bins} bins of {self.bin_width:.4f} ns, "
