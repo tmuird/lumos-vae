@@ -147,3 +147,22 @@ def test_tailed_irf_matches_photon_simulation(tau, tail_tau):
     ok = mu > 5
     assert abs(p.sum() - 1) < 1e-6
     assert ((h[ok] - mu[ok]) ** 2 / mu[ok]).sum() / ok.sum() < 1.6
+
+
+def test_spatial_prior_step():
+    """Latent MRF prior: stacked context in, neighbour edges couple the latents."""
+    torch.manual_seed(0)
+    module = FlimModule(n_bins=N_BINS, bin_width=BIN, latent_dim=4, hidden_dim=16, decoder_dim=16,
+                        conv_channels="8,8", spatial=3, spatial_mode="stack", spatial_prior=1.0)
+    module.log = lambda *a, **k: None  # no trainer attached
+    B = 6
+    batch = {
+        "x": torch.poisson(torch.full((B, 1, N_BINS), 20.0)),
+        "context": torch.poisson(torch.full((B, 8, 1, N_BINS), 20.0)),
+        "edges": torch.tensor([[0, 1], [1, 2], [3, 4], [4, 5], [0, 3]]),
+    }
+    module.train()
+    loss = module._step(batch, "train")
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(p.grad).all() for p in module.parameters() if p.grad is not None)

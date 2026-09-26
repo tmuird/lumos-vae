@@ -148,7 +148,7 @@ class FlimVAE(nn.Module):
             sample = self.training
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar) * scale if sample else mu
         out = self.decode(z, totals)
-        out.update(mu=mu, logvar=logvar, totals=totals)
+        out.update(mu=mu, logvar=logvar, totals=totals, z=z)
         return out
 
 

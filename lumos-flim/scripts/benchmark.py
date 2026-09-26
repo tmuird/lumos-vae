@@ -23,6 +23,7 @@ empirical Bayes). All fit the IRF from the data.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -42,7 +43,9 @@ from lumos_flim.vae_module import FlimModule
 
 METHODS = ["vae", "vae_spatial", "vae_stack", "eb", "tv", "binned", "global", "mle"]
 SPATIAL_MODE = {"vae_spatial": "sum", "vae_stack": "stack"}
-EMBRYO = "/home/user/phasorpy/phasorpy-data/zenodo_8046636/Embryo.tif"
+# Directory holding the FLUTE files (zenodo_8046636 in phasorpy-data).
+FLUTE_DIR = os.environ.get("FLUTE_DIR", "/home/user/phasorpy/phasorpy-data/zenodo_8046636")
+EMBRYO = os.path.join(FLUTE_DIR, "Embryo.tif")
 
 
 def heldout_nll(pred, held):

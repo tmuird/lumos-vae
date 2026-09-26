@@ -416,6 +416,22 @@ the KL. It is not the ELBO, so it is only a diagnostic. It made every metric
 worse. The low latent usage (one to two dimensions carry information) is the
 correct β = 1 optimum, not an optimisation failure.
 
+**Spatial prior** (`spatial_prior` λ > 0). The independent N(0, I) prior
+over each pixel's latent is replaced by a Markov random field:
+−log p(Z) = ½ Σ|z_i|² + λ Σ_(i~j) sqrt(|z_i − z_j|² + δ²) + const. The
+coupling is TV's edge-preserving penalty, applied in latent space. Its
+expectation is estimated from the reparameterised samples already drawn, and
+for fixed λ the normaliser is constant, so the objective remains an ELBO.
+Under the independent prior neighbouring pixels are independent, so the
+exact posterior ignores them, and no encoder context can help. Under the MRF
+they are not, and the stacked-neighbour encoder has a reason to use what it
+sees. A mean-field posterior also pays the coupling on its own noise
+(independent sampling noise looks like disagreement), which pushes posterior
+spreads down; that is what this objective implies, not a bug. Training
+draws contiguous tiles (`TileDataset`, next section) so neighbours share a
+batch. The per-pixel val ELBO omits the coupling, so with the prior on,
+`last.ckpt` from the full cosine schedule is used.
+
 **Validation** always reports the β = 1 negative ELBO (`val_neg_elbo`),
 whatever schedule trained the model, and checkpoints are selected on it.
 
@@ -457,6 +473,9 @@ whatever learning rate it had reached.
   for the stacked spatial encoder. `spatial_context` picks the sum or the
   stack.
 - `neighbour_pairs`: the 4-connected neighbour pairs, for the TV baseline.
+- `TileDataset`: batches of a few 16×16 windows cut around random training
+  pixels, with their 4-connected neighbour pairs, for the MRF prior. Val
+  pixels are holes in the tiles, so they stay unseen.
 - `PixelDataset`: tensors optionally placed on the GPU up front.
   `__getitems__` gathers a whole batch with one indexing call; per-pixel
   indexing would be slow once the data sits on a GPU. LUMOS does the same.
@@ -648,9 +667,18 @@ baselines". In short:
   data is piecewise constant, exactly its assumption. The VAE is ahead of
   empirical Bayes, global analysis and per-pixel MLE, and keeps edges sharp
   without a spatial prior.
-- **Neighbourhood context in the encoder** (summed or stacked) changes
-  little. Pooling across pixels would need a spatial term in the objective,
-  not just in the encoder's input.
+- **Neighbourhood context in the encoder** alone changes little, because
+  under an independent prior neighbours carry no information about a pixel.
+  With the latent MRF prior (5×5 context, λ = 10) the VAE passes binning on
+  the synthetic cells and closes most of the gap to TV. On the embryo it
+  neither helps nor hurts.
+- **Training and inference are not the bottleneck.** Validation is flat by
+  the end of training, and optimising each pixel's posterior directly gains
+  only 0.03 to 0.06 nats per pixel over the encoder.
+- **Transfer.** A model trained on one image processes another in seconds
+  with no tuning, at the accuracy of binning. But its population prior pulls
+  the new image towards the old one, so conditions should be compared with
+  one model trained on all of them.
 - **An unmodelled IRF tail** biases every method's mean lifetime upwards.
   `--irf_tail` nearly halves this for the VAE, but the tail is only partly
   identifiable from the photons alone.

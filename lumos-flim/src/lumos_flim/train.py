@@ -38,6 +38,11 @@ DEFAULTS = dict(
     conv_channels="32,64,128",
     spatial=0,  # encoder also sees the k x k neighbourhood (e.g. 3); 0 for none
     spatial_mode="sum",  # "sum": one summed context histogram; "stack": each neighbour separately
+    # Latent MRF prior between neighbouring pixels (0 for the independent
+    # prior). Trains on contiguous tiles; best used with --spatial 3
+    # --spatial_mode stack so the encoder can see the neighbours it is tied to.
+    spatial_prior=0.0,
+    tile=16,
     # Objective. beta = 1 is the ELBO; warm-up ramps up to it and free bits
     # departs from it, so both are off by default.
     kl_weight=1.0,
@@ -69,6 +74,8 @@ def make_run_name(cfg) -> str:
     parts = [Path(cfg["data"]).stem, f"F{cfg['n_components']}", f"z{cfg['latent_dim']}"]
     if cfg["irf_tail"]:
         parts.append("tail")
+    if cfg["spatial_prior"]:
+        parts.append(f"mrf{cfg['spatial_prior']:g}")
     if cfg["spatial"]:
         parts.append(f"sp{cfg['spatial']}{cfg['spatial_mode'][0]}")
     if cfg["kl_warmup_epochs"]:
@@ -89,7 +96,8 @@ def train(cfg):
     print(f"training on {device}")
     dm = FlimDataModule(cfg["data"], batch_size=cfg["batch_size"], transductive=cfg["transductive"],
                         preload_device=preload, spatial=cfg["spatial"],
-                        spatial_mode=cfg["spatial_mode"])
+                        spatial_mode=cfg["spatial_mode"], tiles=cfg["spatial_prior"] > 0,
+                        tile=cfg["tile"])
     dm.setup()
 
     irf_t0, irf_sigma = dm.irf_t0_guess, 0.1
@@ -123,6 +131,7 @@ def train(cfg):
         kl_warmup_epochs=cfg["kl_warmup_epochs"], free_bits=cfg["free_bits"],
         max_epochs=cfg["max_epochs"], lr_schedule=cfg["lr_schedule"], spatial=cfg["spatial"],
         spatial_mode=cfg["spatial_mode"], irf_tail=cfg["irf_tail"],
+        spatial_prior=cfg["spatial_prior"],
     )
 
     # Validate about every val_check_steps optimiser steps.
@@ -163,6 +172,13 @@ def train(cfg):
     trainer.fit(module, dm, ckpt_path=ckpt_path)
     best = callbacks[0]
     print(f"best checkpoint: {best.best_model_path} (val_neg_elbo={float(best.best_model_score):.4f})")
+    if cfg["spatial_prior"] > 0:
+        # The val ELBO is computed per pixel, without the neighbour coupling,
+        # so it is not the training objective; with the cosine schedule the
+        # final weights are the ones to use.
+        last = str(Path(callbacks[1].dirpath) / "last.ckpt")
+        print(f"spatial prior: using {last}")
+        return last
     return best.best_model_path
 
 

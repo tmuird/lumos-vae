@@ -20,7 +20,7 @@ from xml.etree import ElementTree
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 SPLITS = {"train": 0, "val": 1, "test": 2}
 GT_VARS = ("gt_tau", "gt_fraction", "gt_background")
@@ -225,6 +225,60 @@ class PixelDataset(Dataset):
         return batch
 
 
+class TileDataset(IterableDataset):
+    """Batches of spatially contiguous pixels, for the latent MRF prior.
+
+    Each batch is a few ``tile`` x ``tile`` windows cut around randomly chosen
+    pixels, with the list of 4-connected neighbour pairs inside them, so the
+    loss can couple neighbouring latents. Pixels outside the training set
+    (val pixels, dropped dim pixels) are holes in the tiles. One epoch yields
+    about as many pixels as the training set holds.
+    """
+
+    def __init__(self, base: PixelDataset, image, y, x, shapes, batch_size=512, tile=16, seed=0):
+        self.base = base
+        self.tile = tile
+        self.tiles_per_batch = max(1, batch_size // (tile * tile))
+        self.n_batches = max(1, len(base) // (self.tiles_per_batch * tile * tile))
+        self.image, self.y, self.x = np.asarray(image), np.asarray(y), np.asarray(x)
+        # Padded index grids: row of the training set at each pixel, else -1.
+        self.grids = []
+        for i, (h, w) in enumerate(shapes):
+            g = np.full((h + 2 * tile, w + 2 * tile), -1, dtype=np.int64)
+            m = self.image == i
+            g[self.y[m] + tile, self.x[m] + tile] = np.flatnonzero(m)
+            self.grids.append(g)
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return self.n_batches
+
+    def _batch(self):
+        t = self.tile
+        rows, edges, offset = [], [], 0
+        for p in self.rng.integers(0, len(self.base), self.tiles_per_batch):
+            g = self.grids[self.image[p]]
+            oy = self.y[p] + t - self.rng.integers(0, t)
+            ox = self.x[p] + t - self.rng.integers(0, t)
+            win = g[oy:oy + t, ox:ox + t]
+            present = win >= 0
+            pos = np.full(win.shape, -1, dtype=np.int64)
+            pos[present] = offset + np.arange(present.sum())
+            for a, b in ((pos[:, :-1], pos[:, 1:]), (pos[:-1, :], pos[1:, :])):
+                ok = (a >= 0) & (b >= 0)
+                edges.append(np.stack([a[ok], b[ok]], 1))
+            rows.append(win[present])
+            offset += present.sum()
+        idx = np.concatenate(rows)
+        batch = self.base.__getitems__(idx.tolist())
+        batch["edges"] = torch.as_tensor(np.concatenate(edges), device=self.base.counts.device)
+        return batch
+
+    def __iter__(self):
+        for _ in range(self.n_batches):
+            yield self._batch()
+
+
 def _identity(batch):
     return batch
 
@@ -240,8 +294,11 @@ class FlimDataModule(pl.LightningDataModule):
 
     def __init__(self, path, batch_size: int = 512, transductive: bool = True,
                  num_workers: int = 0, preload_device=None, spatial: int = 0,
-                 spatial_mode: str = "sum"):
+                 spatial_mode: str = "sum", tiles: bool = False, tile: int = 16):
         super().__init__()
+        # Contiguous tiles instead of shuffled pixels, for the latent MRF prior.
+        self.tiles = tiles
+        self.tile = tile
         # Neighbourhood size for the spatial encoder's context, 0 for none,
         # and whether the neighbours are summed or kept separate.
         self.spatial = spatial
@@ -274,9 +331,14 @@ class FlimDataModule(pl.LightningDataModule):
                                   meta["image_shapes"], self.spatial, self.spatial_mode)
         pick = lambda m: None if ctx is None else ctx[m]  # noqa: E731
         self.train_ds = PixelDataset(counts[fit], {k: v[fit] for k, v in gt.items()}, dev, pick(fit))
+        if self.tiles:
+            self.train_ds = TileDataset(self.train_ds, ds["image"].values[fit], ds["y"].values[fit],
+                                        ds["x"].values[fit], meta["image_shapes"],
+                                        self.batch_size, self.tile)
         self.val_ds = PixelDataset(counts[val], {k: v[val] for k, v in gt.items()}, dev, pick(val))
         self.irf_t0_guess = irf_t0_guess(counts[fit], self.bin_width)
-        print(f"FlimDataModule: {len(self.train_ds)} fit, {len(self.val_ds)} val pixels, "
+        n_fit = int(fit.sum())
+        print(f"FlimDataModule: {n_fit} fit, {len(self.val_ds)} val pixels, "
               f"{self.n_channels} channel(s) x {self.n_bins} bins of {self.bin_width:.4f} ns, "
               f"median {np.median(counts[fit].sum((1, 2))):.0f} photons/pixel"
               + (f", preloaded to {dev}" if dev is not None else ""))
@@ -286,6 +348,8 @@ class FlimDataModule(pl.LightningDataModule):
                           num_workers=self.num_workers, collate_fn=_identity)
 
     def train_dataloader(self):
+        if self.tiles:
+            return DataLoader(self.train_ds, batch_size=None, num_workers=0)
         return self._loader(self.train_ds, self.batch_size, shuffle=True, drop_last=True)
 
     def val_dataloader(self):

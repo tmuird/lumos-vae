@@ -67,6 +67,7 @@ class FlimModule(pl.LightningModule):
         spatial: int = 0,  # neighbourhood window for the encoder's context, 0 for none
         spatial_mode: str = "sum",  # "sum" of the neighbourhood, or "stack" each neighbour
         irf_tail: bool = False,  # add a learned exponential tail to the Gaussian IRF
+        spatial_prior: float = 0.0,  # strength of the latent MRF prior between neighbours
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -105,7 +106,20 @@ class FlimModule(pl.LightningModule):
         else:
             kl_train = kl.mean()
         beta = self.kl_beta() if stage == "train" else self.hparams.kl_weight
-        loss = recon.mean() + beta * kl_train
+        prior = kl_train
+        lam = self.hparams.get("spatial_prior", 0.0)
+        if stage == "train" and lam > 0 and "edges" in batch:
+            # Latent MRF prior: -log p(Z) gains lam * sum over neighbour pairs of
+            # sqrt(|z_i - z_j|^2 + delta^2), an edge-preserving (TV-like)
+            # coupling. Its expectation under q is estimated with the same
+            # reparameterised samples as the likelihood. For fixed lam the
+            # prior's normaliser is a constant, so this is still an ELBO.
+            e = batch["edges"]
+            d = out["z"][e[:, 0]] - out["z"][e[:, 1]]
+            mrf = torch.sqrt((d ** 2).sum(-1) + 1e-4).sum() / x.shape[0]
+            prior = prior + lam * mrf
+            self.log("train_mrf", mrf, on_step=False, on_epoch=True, batch_size=x.shape[0])
+        loss = recon.mean() + beta * prior
         # The objective the model is judged on is always the beta = 1 ELBO.
         elbo = (recon + kl).mean()
 

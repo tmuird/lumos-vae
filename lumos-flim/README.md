@@ -530,6 +530,143 @@ The obvious next step is to combine the two: amortised inference plus a
 spatial term in the objective, for example TV on the decoded parameters of
 neighbouring pixels in a batch of patches.
 
+## Diagnosis: what limits the VAE, and a spatial prior
+
+**It is fully trained.** Validation ELBO is flat over the last 20 to 30
+epochs of every run. At 64 photons the training ELBO sits 0.3 nats per pixel
+below validation: mild overfitting on a single small image, not
+undertraining.
+
+**Inference is not the limit.** The amortisation gap was measured by
+optimising each pixel's posterior directly, starting from the encoder's
+guess. That improves the ELBO by only 0.03 nats per pixel on the embryo and
+0.06 on the realistic data. The encoder already finds nearly the best
+posterior the model allows, so more epochs or per-pixel refinement cannot
+help.
+
+**The formulation was the limit.** Each pixel had its own independent
+N(0, I) prior. Under that model neighbouring pixels are independent, so the
+exact posterior of a pixel ignores its neighbours. That is why giving the
+encoder its neighbours changed nothing: it correctly learned to ignore them.
+TV wins on structured tissue because its objective ties neighbours
+together.
+
+**The fix: a latent Markov random field prior** (`--spatial_prior λ`):
+
+```
+−log p(Z) = ½ Σ_i |z_i|² + λ Σ_(i~j) sqrt(|z_i − z_j|² + δ²) + const
+```
+
+This is TV's edge-preserving coupling, applied to the latents. Its
+expectation under the posterior is estimated from the same reparameterised
+samples as the likelihood. For fixed λ the normaliser is a constant, so the
+objective is still an ELBO. Training draws contiguous tiles of pixels
+(`data.TileDataset`), so neighbour pairs share a batch. With the encoder
+seeing its neighbours (`--spatial 5 --spatial_mode stack`), the model now has
+both a reason and the information to pool them. `scripts/mrf_study.py` runs
+it on the benchmark's own photon splits.
+
+Realistic synthetic tissue, 100 photons:
+
+| window | λ | held-out NLL (nats/photon) | τ_amp bias / IQR / r | τ long r | α MAE |
+|---|---|---|---|---|---|
+| 3x3 | 0 | 3.2712 | +0.18 / 0.245 / 0.916 | 0.79 | 0.065 |
+| 3x3 | 0.3 | 3.2711 | +0.19 / 0.230 / 0.918 | 0.77 | 0.062 |
+| 3x3 | 1 | 3.2706 | +0.20 / 0.216 / 0.925 | 0.79 | 0.059 |
+| 3x3 | 3 | 3.2695 | +0.19 / 0.197 / 0.944 | 0.84 | 0.052 |
+| 3x3 | 10 | 3.2685 | +0.20 / 0.174 / 0.960 | 0.88 | 0.049 |
+| 3x3 | 30 | 3.2692 | +0.20 / 0.167 / 0.955 | 0.86 | 0.052 |
+| 5x5 | 3 | 3.2694 | +0.19 / 0.184 / 0.947 | 0.86 | 0.051 |
+| 5x5 | 10 | 3.2684 | +0.18 / 0.163 / 0.960 | 0.91 | 0.042 |
+| TV-regularised (benchmark) | | 3.2676 | +0.06 / 0.085 / 0.987 | 0.95 | 0.031 |
+| 3x3 binned (benchmark) | | 3.2698 | +0.04 / 0.163 / 0.913 | 0.73 | 0.051 |
+
+Embryo, 5% of photons (64 per pixel), 3x3 context:
+
+| λ | held-out NLL | τ_amp vs full-photon MLE: dev / IQR / r |
+|---|---|---|
+| 0 | 2.8446 | +0.030 / 0.137 / 0.20 |
+| 0.3 | 2.8448 | +0.052 / 0.142 / 0.18 |
+| 1 | 2.8448 | +0.047 / 0.145 / 0.12 |
+| 3 | 2.8448 | +0.055 / 0.142 / 0.21 |
+
+- **On structured tissue the prior helps steadily.** With a 5x5 window and
+  λ = 10 the VAE passes binning on held-out photons. It cuts the gap to TV
+  from 3.6 to 0.8 millinats per photon. Mean-lifetime spread falls by a
+  third, long-lifetime correlation rises from 0.79 to 0.91, and α error
+  from 0.065 to 0.042. TV is still ahead; a 5x5 window is still local,
+  while TV pools across whole regions.
+- **On the embryo it neither helps nor hurts.** The real tissue at 64
+  photons does not have the piecewise-constant structure the prior
+  rewards, consistent with TV's own lead vanishing there.
+- λ has to be chosen per dataset, on held-out photons as for TV. It stays off
+  by default.
+
+## Practical advantages over TV and binning
+
+The case for amortisation is applying a trained model to new data without
+refitting. `scripts/transfer_study.py` trains on the hMSC control image and
+applies the model to the rotenone image (same instrument). Both are thinned
+to 20% of their photons (about 165 per pixel), and all methods are scored on
+rotenone's held-out photons:
+
+| method | held-out NLL (nats/photon) | wall-clock on CPU | median τ_amp (ns) |
+|---|---|---|---|
+| VAE trained on control | 3.3022 | 16 s (inference only; training on control took 143 s) | 0.988 |
+| VAE trained on rotenone | 3.3006 | 186 s | 0.934 |
+| per-pixel MLE | 3.3080 | 436 s | 0.846 |
+| binned | 3.3022 | 805 s (includes the IRF fit) | 0.829 |
+| tv | 3.3008 | 1564 s (includes the IRF fit) | 0.829 |
+
+- **Speed.** The transferred VAE processes a new image in 16 s on CPU, with no
+  tuning parameter. TV takes 26 minutes, because its strength has to be
+  selected by refitting, and binning takes 13. Fitted on the new image
+  itself, the VAE ties TV on held-out photons (3.3006 against 3.3008) at an
+  eighth of its time, training included.
+- **Accuracy of the transfer.** It predicts as well as binning, 1.6 millinats
+  per photon behind a VAE trained on the image itself.
+- **The catch: the learned population prior travels with the model.** The
+  transferred VAE puts rotenone's median mean lifetime at 0.99 ns, against
+  0.93 ns from a VAE trained on rotenone. It partly pulls the new condition
+  towards the old one. To compare conditions, train one model on all the
+  images together; do not train on one and apply it to another.
+- **Where the methods disagree.** On rotenone, TV and binning give 0.83 ns and
+  the VAE 0.93 ns. There is no ground truth. On synthetic data and the embryo
+  the likelihood-maximising methods read 8 to 15% short at these photon
+  counts and the VAE did not, which favours the VAE's value, but it is not
+  proof.
+
+Other practical points:
+- The VAE needs no smoothing strength (TV) or bin size (binning) chosen per
+  image.
+- It keeps edges at full resolution where binning blurs them.
+- It gives a per-pixel posterior spread, not yet checked for calibration.
+
+## Running on a GPU or Mac
+
+```bash
+git clone -b claude/sleepy-ride-t6pomq https://github.com/tmuird/lumos-vae && cd lumos-vae/lumos-flim
+pip install -e ".[test]"
+pytest tests                         # includes test_runs_on_device on CUDA / MPS if present
+git clone --depth 1 https://github.com/phasorpy/phasorpy-data ../phasorpy-data   # FLUTE data
+
+# training picks CUDA, then MPS, then CPU; --accelerator cuda|mps|cpu to force
+python -m lumos_flim.train --data data/hmsc.zarr --kl_warmup_epochs 20
+# with the spatial prior and a tailed IRF, for structured tissue
+python -m lumos_flim.train --data data/hmsc.zarr --kl_warmup_epochs 20 \
+    --spatial 5 --spatial_mode stack --spatial_prior 10 --irf_tail
+```
+
+The benchmark scripts read the FLUTE files from `$FLUTE_DIR`:
+
+```bash
+export FLUTE_DIR=../phasorpy-data/zenodo_8046636
+python scripts/benchmark.py --dataset embryo
+python scripts/transfer_study.py
+```
+On a GPU the VAEs train in seconds, and the slow parts become TV and empirical
+Bayes, which also run on the device through `PixelFitter`.
+
 ## A literal port of lumos-vae (removed)
 
 An earlier variant copied lumos-vae with only the physics changed: global
@@ -572,6 +709,8 @@ has been removed. What it showed:
 | `scripts/plot_evaluation.py` | Evaluation figures |
 | `scripts/benchmark.py`, `scripts/plot_benchmark.py`, `scripts/summarise_benchmark.py` | Eight-method benchmark, figures and tables |
 | `scripts/irf_tail_study.py` | Gaussian against tailed IRF |
+| `scripts/mrf_study.py` | Latent MRF prior strength and window |
+| `scripts/transfer_study.py` | Train on one image, apply to another |
 
 Store layout: `counts [sample, channel, time]`, `split`, `image`, `y`, `x`,
 and `gt_*` for synthetic data. Attributes: `bin_width_ns`, `period_ns`,
