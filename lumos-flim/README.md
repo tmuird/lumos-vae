@@ -129,24 +129,11 @@ data against fit, with normalised residuals:
 ![direct fits, synthetic](docs/synthetic_direct_fits.png)
 ![direct fits, hMSC](docs/hmsc_direct_fits.png)
 
-**Synthetic, 96x96, ~1000 photons/pixel, bi-exponential (τ 2-3.5 ns and
-0.3-0.6 ns) plus background.** These are held-out pixels. The relative
-lifetime errors are signed median / interquartile range, and α is the
-amplitude fraction of the long component:
-
-| | τ long | τ short | α long bias | background abs err |
-|---|---|---|---|---|
-| per-pixel MLE | -0.2% / 0.18 | -2.4% / 0.39 | -0.006 | 0.022 |
-| VAE, `kl_weight=1` | +7.0% / 0.085 | +5.8% / 0.16 | -0.037 | 0.011 |
-| VAE, `kl_weight=0.1` | +2.7% / 0.10 | +2.5% / 0.29 | -0.007 | 0.012 |
-
-The VAE learns the IRF from scratch to t0 = 1.00 ns and σ = 0.120 ns (the true
-values), and reaches a reduced chi-square of 1.0. It roughly halves the spread
-of the per-pixel estimates, but at `kl_weight=1` the prior's shrinkage leaves
-a bias of about 7% on the lifetimes. The KL weight trades between the two.
-MLE is close to unbiased but noisy, as expected at this photon count. With 8
-spectral channels (`--channels 8`), the two emission spectra are recovered
-with the right shapes and lifetimes to about 8%.
+**Synthetic ground truth.** The VAE learns the IRF from scratch to
+t0 = 1.00 ns and σ = 0.120 ns (the true values) with reduced chi-square 1.0.
+Accuracy against the per-pixel fit and global analysis is in the evaluation
+below. With 8 spectral channels (`--channels 8`), the two emission spectra
+are recovered with the right shapes and lifetimes to about 8%.
 
 **Fluorescein references.** A free single-exponential fit gives 3.99 ns for
 the embryo reference (literature 4.0-4.2 ns). The hMSC reference gives
@@ -161,103 +148,182 @@ refine the IRF.
 
 | | τ bound (ns) | τ free (ns) | α free | amplitude-weighted τ (ns) | reduced χ² |
 |---|---|---|---|---|---|
-| control, VAE | 3.42 | 0.51 | 0.79 | 1.10 | 1.04 |
+| control, VAE | 3.17 | 0.51 | 0.79 | 1.07 | 1.04 |
 | control, MLE | 3.12 | 0.48 | 0.79 | 1.08 | 0.99 |
-| rotenone, VAE | 3.08 | 0.48 | 0.81 | 0.96 | 1.04 |
+| rotenone, VAE | 2.90 | 0.46 | 0.81 | 0.93 | 1.04 |
 | rotenone, MLE | 2.80 | 0.43 | 0.82 | 0.89 | 0.99 |
 
 The lifetimes sit in the usual NADH ranges (free about 0.4 ns, bound 2-3.4
 ns). Rotenone shortens the mean lifetime and raises the free fraction. The raw
 phasor shows the same shift with no model at all: phase 43.3° to 40.4°,
-modulation 0.58 to 0.61. The VAE's bound lifetime is about 10% above MLE's,
-consistent with the synthetic bias at `kl_weight=1`.
+modulation 0.58 to 0.61. VAE numbers are posterior medians over 20 draws;
+decoding the posterior mean instead put the bound lifetime about 10% high
+(see Inference below).
 
 ![hMSC control](docs/hmsc_control.png)
 ![hMSC rotenone](docs/hmsc_rotenone.png)
 
-Caveats on the maps. At `kl_weight=1` the per-pixel spread of α is narrow
-(roughly 0.79-0.84 in the rotenone image), which is prior shrinkage and not
-evidence of uniform metabolism. τ bound and τ free also dip together in some
-cells. That could be biology, or the two lifetimes trading off, which a
-bi-exponential at ~800 photons is prone to. Lower `kl_weight` or fitting
-lifetimes globally with per-pixel fractions would help tell these apart.
+Caveat on the maps: the VAE's per-pixel spread of α is narrow (0.77-0.84
+in the rotenone image, 2nd to 98th percentile; the per-pixel fit spans
+0.67-0.91, including its own noise). Some of that is the prior pulling
+pixels towards the population, so it is not evidence of uniform metabolism.
 
-## Low-photon sweep
+## Evaluation
 
-`scripts/photon_sweep.py` simulates the same maps at 50 to 1000 photons per
-pixel. At each level it fits the direct per-pixel MLE (`baseline.py
---fit_irf`) and the VAE, and scores the val pixels, which the VAE was not
-fitted on. Lifetime biases and
-IQRs are relative. α MAE is the absolute error in the long component's
-amplitude fraction. τ_amp is the amplitude-weighted mean lifetime, the number
-usually reported at low counts. The reconstruction error is the mean over bins
-of (μ̂ − μ_true)² / μ_true against the noise-free histogram; the raw
-measurement scores about 1 on it, so lower means denoised. One seed, 60
-epochs, CPU.
+Three methods, each fitted end to end with the IRF learned from the data (no
+calibration file):
 
-| photons | method | τ long bias / IQR | τ short bias / IQR | α MAE | τ_amp bias / IQR | reconstruction error |
-|---|---|---|---|---|---|---|
-| 50 | raw data | | | | | 0.93 |
-| 50 | MLE | -0.03 / 0.46 | -0.35 / 1.16 | 0.187 | -0.27 / 0.59 | 0.037 |
-| 50 | VAE | +0.25 / 0.15 | -0.03 / 0.24 | 0.174 | -0.20 / 0.24 | 0.026 |
-| 100 | raw data | | | | | 0.94 |
-| 100 | MLE | -0.03 / 0.37 | -0.30 / 0.85 | 0.136 | -0.20 / 0.45 | 0.043 |
-| 100 | VAE | +0.25 / 0.14 | -0.05 / 0.24 | 0.156 | -0.17 / 0.21 | 0.040 |
-| 200 | raw data | | | | | 0.96 |
-| 200 | MLE | -0.04 / 0.31 | -0.26 / 0.71 | 0.091 | -0.16 / 0.36 | 0.049 |
-| 200 | VAE | +0.22 / 0.13 | -0.05 / 0.23 | 0.148 | -0.17 / 0.18 | 0.065 |
-| 500 | raw data | | | | | 0.96 |
-| 500 | MLE | -0.02 / 0.22 | -0.17 / 0.51 | 0.057 | -0.08 / 0.23 | 0.053 |
-| 500 | VAE | +0.14 / 0.11 | +0.00 / 0.18 | 0.088 | -0.07 / 0.14 | 0.057 |
-| 1000 | raw data | | | | | 0.97 |
-| 1000 | MLE | -0.02 / 0.17 | -0.09 / 0.39 | 0.042 | -0.04 / 0.16 | 0.055 |
-| 1000 | VAE | +0.07 / 0.08 | +0.05 / 0.16 | 0.042 | -0.01 / 0.10 | 0.036 |
+- **VAE**: the amortised model, β = 1 ELBO with a 20-epoch KL warm-up,
+  per-pixel parameters as posterior medians over 20 draws.
+- **Per-pixel MLE**: every pixel fitted independently by maximum likelihood
+  (`baseline.py --fit_irf`).
+- **Global analysis**: one set of lifetimes shared by every pixel, fractions
+  and background per pixel (`baseline.py --fit_irf --global_lifetimes`). This
+  is the usual remedy for low counts in FLIM.
 
-What it shows:
+One seed, 60 epochs, CPU. Scripts: `scripts/photon_sweep.py`,
+`scripts/thinning_study.py`, `scripts/kl_study.py`, and
+`scripts/plot_evaluation.py` for the figures.
 
-- **Denoising.** The VAE and MLE reconstruct the histogram 15 to 35 times
-  closer to the truth than the raw counts, because five
-  parameters per pixel cannot follow shot noise. The VAE and MLE are
-  comparable here (the VAE is ahead at 50, 100 and 1000 photons, behind at
-  200 and 500). This comes from the physics, not from amortisation.
-- **Mean lifetime.** τ_amp is where the VAE earns its keep. Its spread is 1.6
-  to 2.5 times tighter than MLE's at every photon level, with similar or
-  smaller bias. Both underestimate it by about 20% at 50 to 100 photons,
-  which looks like a limit of the information in the data, not of either
-  method.
-- **Short lifetime.** MLE's short lifetime collapses at low counts (−35% bias,
-  IQR 1.16 at 50 photons). The VAE's stays near unbiased with a fifth of the
-  spread.
-- **Long lifetime and α.** The VAE's long lifetime is biased high (+25% at
-  50 to 100 photons, +7% at 1000), where MLE is unbiased but two to three times
-  as spread. On α, MLE is better from 100 to 500 photons. Pooling across pixels
-  pulls both quantities towards the population, which is the shrinkage cost.
+### Inference: decode samples, not the mean
 
-How much of the VAE's tighter spread is information and how much is
-shrinkage? Its latent carries only 0.4, 0.9 and 1.9 nats per pixel at 50,
-200 and 1000 photons, in one or two active dimensions out of 16. Against a
-predictor that outputs the population median for every pixel (held-out
-pixels, r is the correlation with the truth):
+Decoding the posterior mean of the latent put the long lifetime 22% high and
+tripled the α error (0.149 against 0.046 at 200 photons, same checkpoint).
+The decoder is nonlinear and the posterior is wide, so the decoded mean is
+not the posterior's view of the parameters. Taking the median of the
+parameters over posterior draws, as lumos-vae's `sample_posterior` does,
+removes the bias. It is now the default in `predict.py`. Every VAE number in
+earlier versions of this README that showed a 7-25% lifetime bias came from
+mean decoding.
 
-| photons | long lifetime, VAE | long lifetime, constant | mean lifetime, VAE | mean lifetime, constant |
+### KL: β = 1 is right
+
+The model uses only one or two of its 16 latent dimensions. To test whether
+that is the β = 1 optimum or an optimisation failure, the same data was fitted
+with the plain ELBO, with KL warm-up (which ends at β = 1, so the objective is
+unchanged), and with free bits (which changes the objective by exempting the
+first few nats per dimension from the KL):
+
+| photons | objective | −ELBO (val) | KL (nats) | active dims | τ long bias / IQR | τ_amp IQR | α MAE |
+|---|---|---|---|---|---|---|---|
+| 200 | beta1 | 29.80 | 0.86 | 1 | -0.004 / 0.085 | 0.219 | 0.046 |
+| 200 | warmup20 | 29.77 | 0.95 | 2 | -0.005 / 0.082 | 0.205 | 0.046 |
+| 200 | freebits0.25 | 31.74 | 3.70 | 16 | -0.020 / 0.138 | 0.218 | 0.056 |
+| 200 | freebits1 | 37.98 | 9.69 | 16 | +0.076 / 0.160 | 0.241 | 0.065 |
+| 1000 | beta1 | 31.30 | 2.06 | 2 | -0.008 / 0.064 | 0.110 | 0.026 |
+| 1000 | warmup20 | 31.21 | 2.06 | 2 | -0.002 / 0.066 | 0.109 | 0.026 |
+| 1000 | freebits0.25 | 33.31 | 4.76 | 16 | -0.006 / 0.077 | 0.115 | 0.029 |
+| 1000 | freebits1 | 40.54 | 11.12 | 16 | +0.016 / 0.097 | 0.129 | 0.039 |
+
+Warm-up gives a slightly better ELBO than plain training with the same
+accuracy. Free bits uses all 16 dimensions and is worse on every count. So
+the low latent usage is the correct β = 1 optimum: the data does not support
+more per-pixel information, and forcing it in adds noise. With the exact
+Poisson likelihood there is no reason to move β away from 1.
+
+### Synthetic data, 50 to 1000 photons per pixel
+
+Held-out pixels, scored against ground truth. Relative errors on the
+amplitude-weighted mean lifetime τ_amp, r is the correlation with the truth,
+α MAE is the error in the long component's amplitude fraction, and the
+reconstruction error is the mean over bins of (μ̂ − μ)² / μ against the
+noise-free histogram (raw counts score about 1).
+
+![synthetic sweep](docs/eval_synthetic_sweep.png)
+
+| photons | method | τ_amp bias / IQR | τ_amp r | τ long r | τ short IQR | α MAE | reconstruction |
+|---|---|---|---|---|---|---|---|
+| 50 | VAE | +0.01 / 0.30 | 0.57 | 0.58 | 0.24 | 0.058 | 0.0074 |
+| 50 | MLE | -0.27 / 0.59 | 0.37 | 0.17 | 1.16 | 0.187 | 0.0375 |
+| 50 | global | -0.05 / 0.43 | 0.53 | — | 0.23 | 0.121 | 0.0228 |
+| 50 | raw data | | | | | | 0.93 |
+| 100 | VAE | +0.00 / 0.24 | 0.70 | 0.69 | 0.22 | 0.050 | 0.0102 |
+| 100 | MLE | -0.20 / 0.45 | 0.53 | 0.20 | 0.85 | 0.136 | 0.0427 |
+| 100 | global | -0.02 / 0.31 | 0.66 | — | 0.24 | 0.090 | 0.0264 |
+| 100 | raw data | | | | | | 0.94 |
+| 200 | VAE | -0.01 / 0.21 | 0.79 | 0.78 | 0.20 | 0.044 | 0.0152 |
+| 200 | MLE | -0.16 / 0.36 | 0.62 | 0.33 | 0.71 | 0.091 | 0.0485 |
+| 200 | global | -0.01 / 0.22 | 0.78 | — | 0.25 | 0.067 | 0.0307 |
+| 200 | raw data | | | | | | 0.96 |
+| 500 | VAE | -0.00 / 0.14 | 0.89 | 0.85 | 0.17 | 0.034 | 0.0202 |
+| 500 | MLE | -0.08 / 0.23 | 0.76 | 0.45 | 0.51 | 0.057 | 0.0535 |
+| 500 | global | +0.01 / 0.16 | 0.88 | — | 0.27 | 0.050 | 0.0376 |
+| 500 | raw data | | | | | | 0.96 |
+| 1000 | VAE | -0.00 / 0.11 | 0.93 | 0.88 | 0.16 | 0.025 | 0.0242 |
+| 1000 | MLE | -0.04 / 0.16 | 0.86 | 0.58 | 0.39 | 0.042 | 0.0549 |
+| 1000 | global | +0.01 / 0.13 | 0.92 | — | 0.27 | 0.045 | 0.0506 |
+| 1000 | raw data | | | | | | 0.97 |
+
+- The VAE is best or joint best on every measure at every photon count. The
+  clearest gains are in α (0.058 against 0.121 for global analysis and 0.187
+  for per-pixel MLE at 50 photons) and in the long lifetime, which only it can
+  resolve per pixel at low counts (r = 0.58 at 50 photons against 0.17).
+  Global analysis's short-lifetime IQR only looks competitive because it
+  gives every pixel the same value, so its IQR is just the spread of the
+  truth.
+- Its mean lifetime is essentially unbiased at every level. Per-pixel MLE
+  underestimates it by 27% at 50 photons.
+- Global analysis is close to the VAE on mean lifetime from 200 photons up.
+  Here the true lifetimes vary between pixels, which is exactly what global
+  analysis assumes away, so this dataset favours the VAE on that point.
+- Reconstructions from all three methods are 18 to 130 times closer to the
+  truth than the raw counts. The VAE's are 2 to 5 times closer again.
+
+### Real data at varying noise levels: zebrafish embryo
+
+The embryo image from FLUTE (not used anywhere else here), 2x2 binned,
+pixels with at least 1000 photons (9094 pixels, median 1256). Noise levels
+are made by keeping each photon with probability f. Binomial thinning of a
+Poisson process is exactly the data of an acquisition f times as long, so
+nothing is simulated. The photons removed are an independent measurement of
+the same pixel, which gives a score that needs no ground truth: the negative
+log-likelihood of the held-out photons under each method's fitted histogram.
+Mean lifetimes are compared against per-pixel MLE on all photons. That
+reference shares both photons and estimator with the thinned MLE, so it
+flatters MLE; the held-out-photon score is the unbiased comparison.
+
+![embryo thinning](docs/eval_embryo_thinning.png)
+
+| photons | method | held-out NLL (nats/photon) | τ_amp deviation median / IQR | τ_amp r |
 |---|---|---|---|---|
-| 50 | IQR 0.15, r = 0.54 | IQR 0.15 | IQR 0.24, r = 0.57 | IQR 0.33 |
-| 200 | IQR 0.13, r = 0.69 | IQR 0.15 | IQR 0.18, r = 0.78 | IQR 0.33 |
-| 1000 | IQR 0.08, r = 0.83 | IQR 0.15 | IQR 0.10, r = 0.94 | IQR 0.33 |
+| 630 | VAE | 2.8493 | +0.007 / 0.109 | 0.68 |
+| 630 | global | 2.8504 | +0.007 / 0.116 | 0.51 |
+| 630 | MLE | 2.8519 | -0.015 / 0.089 | 0.78 |
+| 630 | raw data | 2.8851 | | |
+| 252 | VAE | 2.8503 | +0.005 / 0.125 | 0.48 |
+| 252 | global | 2.8537 | +0.008 / 0.134 | 0.38 |
+| 252 | MLE | 2.8570 | -0.049 / 0.181 | 0.56 |
+| 252 | raw data | 2.9221 | | |
+| 126 | VAE | 2.8500 | +0.010 / 0.127 | 0.34 |
+| 126 | global | 2.8573 | +0.005 / 0.163 | 0.30 |
+| 126 | MLE | 2.8637 | -0.081 / 0.266 | 0.37 |
+| 126 | raw data | 2.9696 | | |
+| 65 | VAE | 2.8527 | +0.072 / 0.156 | 0.25 |
+| 65 | global | 2.8677 | -0.024 / 0.212 | 0.21 |
+| 65 | MLE | 2.8797 | -0.134 / 0.381 | 0.26 |
+| 65 | raw data | 3.0504 | | |
 
-The mean lifetime tracks the truth at every level. At 50 photons the long
-lifetime does not: its spread equals the constant's, which is the VAE
-falling back on the population value. MLE (IQR 0.46) does worse than the
-constant there. The ELBO is correctly scaled, so this collapse is mostly the
-data being uninformative (a bi-exponential can trade a long lifetime against
-its fraction at almost no cost in likelihood), but 1.9 nats at 1000 photons
-is probably short of what the data supports.
+![embryo maps](docs/eval_embryo_maps.png)
 
-Extrapolation is not used in the FLIM setting. TCSPC records every delay bin
-in parallel, so late bins cost nothing extra; what is scarce is photons.
-Fitting early bins and extrapolating the tail, which pays off in LUMOS where
-late frames cost time and bleaching, has no counterpart here, and all
-methods use the full period.
+- The VAE predicts unseen photons best at every noise level, and the margin
+  grows as photons drop: 15 millinats per photon ahead of global analysis and
+  27 ahead of per-pixel MLE at 65 photons. The raw thinned histogram is 36 to
+  198 millinats per photon behind.
+- Its mean lifetime has the smallest spread against the reference at 252
+  photons and below.
+- It keeps the tissue structure down to 65 photons per pixel, where per-pixel
+  MLE has dissolved into speckle and drifted 13% short.
+- But at 65 photons the VAE's map shifts about 7% long against the reference.
+  It did not do this on synthetic data. Real tissue has a lifetime
+  distribution the smooth synthetic maps do not, and at very low counts the
+  model leans on what it learned from the population. The shift is visible in
+  the right-hand column of the maps and should be kept in mind below about 100
+  photons per pixel.
+
+Example fits at 5% of the photons, with the held-out photons (rescaled) as an
+independent check on the shape:
+
+![embryo fits](docs/eval_embryo_fits.png)
 
 ## A literal port of lumos-vae (removed)
 
@@ -295,7 +361,10 @@ has been removed. What it showed:
 | `calibrate.py` | IRF from a reference dye of known lifetime |
 | `train.py`, `predict.py` | Training and inference, maps and per-image summaries |
 | `baseline.py` | Independent per-pixel MLE with the same physics, IRF optionally fitted |
-| `scripts/photon_sweep.py` | Low-photon comparison against the direct MLE fit |
+| `scripts/photon_sweep.py` | Synthetic sweep against per-pixel MLE and global analysis |
+| `scripts/thinning_study.py` | Real data at varying noise levels, scored on held-out photons |
+| `scripts/kl_study.py` | β = 1 ELBO against KL warm-up and free bits |
+| `scripts/plot_evaluation.py` | Evaluation figures |
 
 Store layout: `counts [sample, channel, time]`, `split`, `image`, `y`, `x`,
 and `gt_*` for synthetic data. Attributes: `bin_width_ns`, `period_ns`,

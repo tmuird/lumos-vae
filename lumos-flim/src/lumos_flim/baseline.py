@@ -24,19 +24,24 @@ from lumos_flim.vae import _SIGMA_FLOOR, FlimVAE
 from lumos_flim.vae_module import FlimModule, n_free_parameters, pearson_chi2, poisson_half_deviance
 
 
-def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf=False):
+def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf=False,
+               global_lifetimes=False):
     """Adam on every pixel at once. Pixels are independent, so the summed loss
     is separable and one optimiser is equivalent to one per pixel.
 
     With ``fit_irf`` the IRF centre and width are fitted as well, shared by
     every pixel, so all pixels go in one chunk. No network is involved: this
     is the direct, non-amortised fit of the physics model to the data.
+
+    With ``global_lifetimes`` the lifetimes are shared by every pixel as well
+    and only the fractions and background are per pixel: global analysis,
+    the usual remedy for low counts.
     """
     Fn = model.n_components
     C = counts.shape[1]
     t0 = model.irf_t0.detach().clone().requires_grad_(fit_irf)
     sigma_raw = model.irf_sigma_raw.detach().clone().requires_grad_(fit_irf)
-    if fit_irf:
+    if fit_irf or global_lifetimes:
         chunk = len(counts)
     bases = model.bases.detach() if model.bases is not None else None
     rate_bias = model.decoder.head_rate.bias.detach()
@@ -47,7 +52,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf
         x = torch.as_tensor(counts[start:start + chunk], dtype=torch.float32)
         B = len(x)
         totals = x.sum((1, 2)).clamp(min=1.0)
-        rate_raw = rate_bias.expand(B, Fn).clone().requires_grad_()
+        rate_raw = (rate_bias[None] if global_lifetimes else rate_bias.expand(B, Fn)).clone().requires_grad_()
         frac_logits = frac_bias.expand(B, Fn + 1).clone().requires_grad_()
         params = [rate_raw, frac_logits] + ([t0, sigma_raw] if fit_irf else [])
         bg_logits = None
@@ -57,7 +62,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf
         opt = torch.optim.Adam(params, lr=lr)
 
         def forward():
-            rates = model.rate_min + torch.cumsum(F.softplus(rate_raw), -1)
+            rates = (model.rate_min + torch.cumsum(F.softplus(rate_raw), -1)).expand(B, Fn)
             probs = F.softmax(frac_logits, -1)
             bg_spec = F.softmax(bg_logits, -1) if bg_logits is not None else None
             sigma = F.softplus(sigma_raw) + _SIGMA_FLOOR
@@ -123,6 +128,8 @@ def main(argv=None):
     p.add_argument("--fit_irf", action="store_true",
                    help="fit the IRF jointly with the pixels; with neither --checkpoint nor "
                         "--irf it starts from the rising edge of the data")
+    p.add_argument("--global_lifetimes", action="store_true",
+                   help="share the lifetimes across all pixels (global analysis)")
     p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--out", default="")
     a = p.parse_args(argv)
@@ -148,7 +155,8 @@ def main(argv=None):
     else:
         raise SystemExit("give --checkpoint, --irf or --fit_irf")
 
-    result, expected = fit_pixels(counts, model, steps=a.steps, fit_irf=a.fit_irf)
+    result, expected = fit_pixels(counts, model, steps=a.steps, fit_irf=a.fit_irf,
+                                  global_lifetimes=a.global_lifetimes)
     print(f"IRF: t0={result.pop('irf_t0'):.3f} ns sigma={result.pop('irf_sigma'):.3f} ns "
           f"({'fitted' if a.fit_irf else 'fixed'})")
     gt_report(result, ds)

@@ -1,9 +1,10 @@
-"""Low-photon sweep: the VAE against the direct per-pixel MLE, with ground truth.
+"""Low-photon sweep: the VAE against per-pixel MLE and global analysis, with ground truth.
 
     python scripts/photon_sweep.py --photons 50 100 200 500 1000 --out results/sweep
 
 For each photon budget the same synthetic maps are simulated photon by photon,
-each method is fitted, and the held-out val pixels (never seen by the VAE)
+the VAE, per-pixel MLE and global analysis (lifetimes shared across the
+image, fractions per pixel) are fitted, and the held-out val pixels (never seen by the VAE)
 are scored on
   - lifetime and amplitude-fraction errors,
   - amplitude-weighted mean lifetime error, the quantity usually reported
@@ -15,6 +16,7 @@ are scored on
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,10 +46,11 @@ def truth(ds, meta):
                            torch.as_tensor(ds["gt_background"].values), decays).numpy()
 
 
-@torch.no_grad()
-def recon_flimvae(module, counts):
-    return module.model(torch.as_tensor(counts, dtype=torch.float32), sample=False)["expected"].numpy()
 
+
+def _r(a, b):
+    """Correlation with the truth; zero for a constant prediction."""
+    return float(np.corrcoef(a, b)[0, 1]) if np.std(a) > 1e-9 else 0.0
 
 
 def score(name, res, recon, ds, mu_true, held):
@@ -68,6 +71,8 @@ def score(name, res, recon, ds, mu_true, held):
         alpha_mae=float(np.median(np.abs(alpha[:, 0] - gt_alpha[:, 0]))),
         tau_amp_bias=float(np.median(tau_amp_rel)),
         tau_amp_iqr=float(np.subtract(*np.percentile(tau_amp_rel, [75, 25]))),
+        tau_long_r=_r(tau[:, 0], gt_tau[:, 0]),
+        tau_amp_r=_r(res["tau_amp"][held], gt["tau_amp"].numpy()),
         denoise=float(np.median(denoise)),
     )
 
@@ -77,6 +82,7 @@ def main():
     p.add_argument("--photons", type=float, nargs="+", default=[50, 100, 200, 500, 1000])
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--out", default="results/sweep")
+    p.add_argument("--vae_args", default="", help="extra lumos_flim.train flags, e.g. '--kl_warmup_epochs 20'")
     a = p.parse_args()
     Path(a.out).mkdir(parents=True, exist_ok=True)
     rows = []
@@ -92,21 +98,25 @@ def main():
         raw_score = float(np.median(((counts[held] - mu_true[held]) ** 2
                                      / np.maximum(mu_true[held], 1e-9)).mean((1, 2))))
 
+        # A leftover best.ckpt would be loaded instead of the new one.
+        shutil.rmtree(f"checkpoints/sweep_{tag}_vae", ignore_errors=True)
         sh(["lumos_flim.train", "--data", store, "--max_epochs", str(a.epochs),
-            "--batch_size", "256", "--run_name", f"sweep_{tag}_vae"])
+            "--batch_size", "256", "--run_name", f"sweep_{tag}_vae", *a.vae_args.split()])
         vae = FlimModule.load_from_checkpoint(f"checkpoints/sweep_{tag}_vae/best.ckpt", map_location="cpu")
-        rows.append(dict(photons=n, **score("VAE", run_model(vae, counts),
-                                            recon_flimvae(vae, counts), ds, mu_true, held)))
+        res = run_model(vae, counts)
+        rows.append(dict(photons=n, **score("VAE", res, res["expected"], ds, mu_true, held)))
 
         init = FlimVAE(n_bins=counts.shape[2], bin_width=meta["bin_width_ns"],
                        irf_t0=irf_t0_guess(counts, meta["bin_width_ns"]), irf_sigma=0.1)
         res, rec = fit_pixels(counts, init, fit_irf=True)
         rows.append(dict(photons=n, **score("MLE", res, rec, ds, mu_true, held)))
+        res, rec = fit_pixels(counts, init, fit_irf=True, global_lifetimes=True)
+        rows.append(dict(photons=n, **score("global", res, rec, ds, mu_true, held)))
         rows.append(dict(photons=n, method="raw data", denoise=raw_score))
 
         with open(f"{a.out}/sweep.json", "w") as f:
             json.dump(rows, f, indent=1)
-        for r in rows[-3:]:
+        for r in rows[-4:]:
             print(json.dumps(r), flush=True)
 
 

@@ -1,10 +1,11 @@
 """Train the FLIM VAE on a pixel store.
 
-    python -m lumos_flim.train --data data/hmsc.zarr --irf irf_hmsc.json --fix_irf
+    python -m lumos_flim.train --data data/hmsc.zarr --irf calibration/irf_hmsc.json --irf_fit free
 
 Without ``--irf`` the IRF starts at the steepest rise of the data and is
 learned with everything else. Ground truth in the store, when present, is
-only logged.
+only logged. Checkpoints are chosen on the beta = 1 ELBO of the val pixels,
+whatever KL schedule was used to get there.
 """
 
 import argparse
@@ -21,67 +22,146 @@ from pytorch_lightning.loggers import CSVLogger
 from lumos_flim.data import FlimDataModule
 from lumos_flim.vae_module import FlimModule
 
+DEFAULTS = dict(
+    # IRF
+    irf="",  # JSON written by lumos_flim.calibrate
+    irf_fit="fixed",  # which calibration fit: "fixed" (reference lifetime held) or "free"
+    fix_irf=False,
+    # Model
+    n_components=2,
+    tau_max=0.0,  # longest lifetime in ns, 0 for one period
+    latent_dim=16,
+    hidden_dim=128,
+    decoder_dim=128,
+    conv_channels="32,64,128",
+    # Objective. beta = 1 is the ELBO; warm-up ramps up to it and free bits
+    # departs from it, so both are off by default.
+    kl_weight=1.0,
+    kl_warmup_epochs=0,
+    free_bits=0.0,
+    # Optimisation
+    learning_rate=1e-3,
+    batch_size=512,
+    max_epochs=100,
+    lr_schedule="cosine",  # "cosine" runs to max_epochs; "none" allows early stopping
+    early_stopping_patience=20,  # in validation checks, ignored under cosine
+    val_check_steps=0,  # validate about every N optimiser steps, 0 for every epoch
+    gradient_clip_val=1.0,
+    transductive=True,
+    seed=0,
+    run_name="",
+    resume="",  # existing run directory to continue from its last.ckpt
+)
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", required=True)
-    p.add_argument("--irf", default="", help="JSON written by lumos_flim.calibrate")
-    p.add_argument("--irf_fit", default="fixed", choices=["fixed", "free"],
-                   help="which calibration fit to take the IRF from: lifetime held at the "
-                        "reference value, or lifetime free")
-    p.add_argument("--fix_irf", action="store_true", help="hold the calibrated IRF fixed")
-    p.add_argument("--n_components", type=int, default=2)
-    p.add_argument("--tau_max", type=float, default=0.0, help="longest lifetime, ns (default: one period)")
-    p.add_argument("--latent_dim", type=int, default=16)
-    p.add_argument("--hidden_dim", type=int, default=128)
-    p.add_argument("--decoder_dim", type=int, default=128)
-    p.add_argument("--conv_channels", default="32,64,128")
-    p.add_argument("--kl_weight", type=float, default=1.0)
-    p.add_argument("--learning_rate", type=float, default=1e-3)
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--max_epochs", type=int, default=100)
-    p.add_argument("--patience", type=int, default=20)
-    p.add_argument("--no_transductive", action="store_true", help="fit on the train split only")
-    p.add_argument("--run_name", default="")
-    p.add_argument("--seed", type=int, default=0)
-    a = p.parse_args(argv)
 
-    pl.seed_everything(a.seed)
+def make_run_name(cfg) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if cfg["run_name"]:
+        return cfg["run_name"]
+    parts = [Path(cfg["data"]).stem, f"F{cfg['n_components']}", f"z{cfg['latent_dim']}"]
+    if cfg["kl_warmup_epochs"]:
+        parts.append(f"warm{cfg['kl_warmup_epochs']}")
+    if cfg["free_bits"]:
+        parts.append(f"fb{cfg['free_bits']:g}")
+    if cfg["kl_weight"] != 1.0:
+        parts.append(f"kl{cfg['kl_weight']:g}")
+    parts += [f"s{cfg['seed']}", ts]
+    return "_".join(parts)
+
+
+def train(cfg):
+    pl.seed_everything(cfg["seed"], workers=True)
     torch.set_float32_matmul_precision("medium")
-    dm = FlimDataModule(a.data, batch_size=a.batch_size, transductive=not a.no_transductive)
+    dm = FlimDataModule(cfg["data"], batch_size=cfg["batch_size"], transductive=cfg["transductive"])
     dm.setup()
 
     irf_t0, irf_sigma = dm.irf_t0_guess, 0.1
-    if a.irf:
-        with open(a.irf) as f:
-            cal = json.load(f)[a.irf_fit]
+    if cfg["irf"]:
+        with open(cfg["irf"]) as f:
+            cal = json.load(f)[cfg["irf_fit"]]
         irf_t0, irf_sigma = cal["irf_t0"], cal["irf_sigma"]
-        print(f"IRF from {a.irf}: t0={irf_t0:.3f} ns sigma={irf_sigma:.3f} ns "
-              f"({'fixed' if a.fix_irf else 'initial'})")
-    elif a.fix_irf:
+        print(f"IRF from {cfg['irf']}: t0={irf_t0:.3f} ns sigma={irf_sigma:.3f} ns "
+              f"({'fixed' if cfg['fix_irf'] else 'initial'})")
+    elif cfg["fix_irf"]:
         raise SystemExit("--fix_irf needs --irf")
+
+    run_name = make_run_name(cfg)
+    run_dir = Path("checkpoints") / run_name
+    ckpt_path = None
+    if cfg["resume"]:
+        run_dir = Path("checkpoints") / cfg["resume"]
+        ckpt_path = run_dir / "last.ckpt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"No last.ckpt in {run_dir}")
+        run_name = cfg["resume"]
+        print(f"Resuming from {ckpt_path}")
 
     module = FlimModule(
         n_bins=dm.n_bins, bin_width=dm.bin_width, n_channels=dm.n_channels,
-        n_components=a.n_components, latent_dim=a.latent_dim, hidden_dim=a.hidden_dim,
-        decoder_dim=a.decoder_dim, conv_channels=a.conv_channels, tau_max=a.tau_max,
-        irf_t0=irf_t0, irf_sigma=irf_sigma, fix_irf=a.fix_irf,
-        learning_rate=a.learning_rate, kl_weight=a.kl_weight, max_epochs=a.max_epochs,
+        n_components=cfg["n_components"], latent_dim=cfg["latent_dim"],
+        hidden_dim=cfg["hidden_dim"], decoder_dim=cfg["decoder_dim"],
+        conv_channels=cfg["conv_channels"], tau_max=cfg["tau_max"],
+        irf_t0=irf_t0, irf_sigma=irf_sigma, fix_irf=cfg["fix_irf"],
+        learning_rate=cfg["learning_rate"], kl_weight=cfg["kl_weight"],
+        kl_warmup_epochs=cfg["kl_warmup_epochs"], free_bits=cfg["free_bits"],
+        max_epochs=cfg["max_epochs"], lr_schedule=cfg["lr_schedule"],
     )
 
-    run_name = a.run_name or f"{Path(a.data).stem}_F{a.n_components}_{datetime.now():%Y%m%d-%H%M%S}"
-    ckpt = ModelCheckpoint(dirpath=f"checkpoints/{run_name}", monitor="val_nll", mode="min",
-                           save_last=True, filename="best")
+    # Validate about every val_check_steps optimiser steps.
+    batches = max(1, len(dm.train_dataloader()))
+    val_every = max(1, round(cfg["val_check_steps"] / batches)) if cfg["val_check_steps"] else 1
+
+    callbacks = [
+        ModelCheckpoint(dirpath=str(run_dir), filename="best", monitor="val_neg_elbo",
+                        mode="min", save_top_k=1),
+        ModelCheckpoint(dirpath=str(run_dir), filename="last", monitor=None,
+                        every_n_epochs=val_every, enable_version_counter=False),
+    ]
+    # Cutting a cosine schedule short leaves the model wherever the rate had
+    # got to, so early stopping only runs without it.
+    if cfg["lr_schedule"] != "cosine" and cfg["early_stopping_patience"] > 0:
+        callbacks.append(EarlyStopping(monitor="val_neg_elbo",
+                                       patience=cfg["early_stopping_patience"], mode="min"))
+
+    logger = CSVLogger("logs", name=run_name)
+    if cfg.get("wandb"):
+        from pytorch_lightning.loggers import WandbLogger
+
+        logger = WandbLogger(project="LUMOS-FLIM", name=run_name, log_model=False)
+
     trainer = pl.Trainer(
-        max_epochs=a.max_epochs,
-        logger=CSVLogger("logs", name=run_name),
-        callbacks=[ckpt, EarlyStopping(monitor="val_nll", patience=a.patience)],
-        gradient_clip_val=1.0,
+        max_epochs=cfg["max_epochs"],
+        check_val_every_n_epoch=val_every,
+        logger=logger,
+        callbacks=callbacks,
+        gradient_clip_val=cfg["gradient_clip_val"],
+        enable_model_summary=False,
         log_every_n_steps=20,
-        enable_progress_bar=sys.stderr.isatty(),
+        # A progress bar redirected to a file repaints into it and bloats logs.
+        enable_progress_bar=sys.stdout.isatty(),
     )
-    trainer.fit(module, dm)
-    print(f"best checkpoint: {ckpt.best_model_path} (val_nll={ckpt.best_model_score:.4f})")
+    trainer.fit(module, dm, ckpt_path=ckpt_path)
+    best = callbacks[0]
+    print(f"best checkpoint: {best.best_model_path} (val_neg_elbo={float(best.best_model_score):.4f})")
+    return best.best_model_path
+
+
+def _build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data", required=True)
+    p.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False,
+                   help="log to Weights and Biases instead of CSV")
+    for key, val in DEFAULTS.items():
+        if isinstance(val, bool):
+            p.add_argument(f"--{key}", action=argparse.BooleanOptionalAction, default=val)
+        else:
+            p.add_argument(f"--{key}", type=type(val), default=val)
+    return p
+
+
+def main(argv=None):
+    cfg = vars(_build_parser().parse_args(argv))
+    train(cfg)
 
 
 if __name__ == "__main__":

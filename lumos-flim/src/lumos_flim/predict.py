@@ -3,8 +3,9 @@
     python -m lumos_flim.predict checkpoints/<run>/best.ckpt --data data/hmsc.zarr --out results/hmsc
 
 Writes ``<out>.npz`` with per-pixel parameters and ``<out>_<image>.png`` maps,
-and prints a per-image summary. With ``--n_samples`` the posterior is sampled
-and the spread of each parameter is saved alongside its mean.
+and prints a per-image summary. Parameters are posterior medians over
+``--n_samples`` draws (default 20), with their spread saved alongside; 0
+decodes the posterior mean once.
 """
 
 import argparse
@@ -30,28 +31,37 @@ def derived(rates, fractions):
 
 
 @torch.no_grad()
-def run_model(module, counts, batch_size=4096, n_samples=0):
+def run_model(module, counts, batch_size=4096, n_samples=20, seed=0):
+    """Per-pixel parameters from the posterior.
+
+    With ``n_samples`` > 0 (the default, as in LUMOS's sample_posterior) each
+    parameter is the median over that many posterior draws, its standard
+    deviation over the draws is returned as ``<name>_std``, and the
+    reconstruction is the mean over draws. With 0 the posterior mean of the
+    latent is decoded once.
+    """
+    torch.manual_seed(seed)
     model = module.model.eval()
-    keys = ("tau", "fractions", "background", "alpha", "tau_int", "tau_amp", "chi2r")
-    out = {k: [] for k in keys}
-    spread = {k: [] for k in ("tau", "alpha")}
-    dof = module.dof
+    keys = ("tau", "fractions", "background", "alpha", "tau_int", "tau_amp")
+    out = {k: [] for k in keys + ("chi2r",)}
+    spread = {k: [] for k in keys}
+    recon = []
     for start in range(0, len(counts), batch_size):
         x = torch.as_tensor(counts[start:start + batch_size], dtype=torch.float32)
-        r = model(x, sample=False)
-        d = derived(r["rates"], r["fractions"])
-        vals = dict(d, fractions=r["fractions"], background=r["background"],
-                    chi2r=pearson_chi2(x, r["expected"]) / dof)
+        draws = [model(x, sample=True) for _ in range(n_samples)] if n_samples else [model(x, sample=False)]
+        vals = [dict(derived(r["rates"], r["fractions"]), fractions=r["fractions"],
+                     background=r["background"]) for r in draws]
         for k in keys:
-            out[k].append(vals[k].numpy())
-        if n_samples:
-            draws = [derived(**{k: v for k, v in model(x, sample=True).items()
-                                if k in ("rates", "fractions")}) for _ in range(n_samples)]
-            for k in spread:
-                spread[k].append(torch.stack([s[k] for s in draws]).std(0).numpy())
+            stack = torch.stack([v[k] for v in vals])
+            out[k].append(stack.median(0).values.numpy())
+            spread[k].append(stack.std(0).numpy() if n_samples > 1 else np.zeros(stack.shape[1:]))
+        expected = torch.stack([r["expected"] for r in draws]).mean(0)
+        recon.append(expected.numpy())
+        out["chi2r"].append((pearson_chi2(x, expected) / module.dof).numpy())
     result = {k: np.concatenate(v) for k, v in out.items()}
-    if n_samples:
+    if n_samples > 1:
         result.update({f"{k}_std": np.concatenate(v) for k, v in spread.items()})
+    result["expected"] = np.concatenate(recon)
     return result
 
 
@@ -132,7 +142,7 @@ def main(argv=None):
     p.add_argument("checkpoint")
     p.add_argument("--data", required=True)
     p.add_argument("--out", default="")
-    p.add_argument("--n_samples", type=int, default=0)
+    p.add_argument("--n_samples", type=int, default=20)
     a = p.parse_args(argv)
 
     module = FlimModule.load_from_checkpoint(a.checkpoint, map_location="cpu")
@@ -146,6 +156,7 @@ def main(argv=None):
     summarise(result, ds, meta, a.out or None)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        result.pop("expected")
         np.savez_compressed(f"{a.out}.npz", image=ds["image"].values, y=ds["y"].values,
                             x=ds["x"].values, split=ds["split"].values, **result)
         print(f"wrote {a.out}.npz")
