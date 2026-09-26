@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from lumos_flim.data import SPLITS, open_store
+from lumos_flim.device import pick_device
 from lumos_flim.physics import amplitude_fractions, mean_lifetimes
 from lumos_flim.vae_module import FlimModule, pearson_chi2
 
@@ -31,24 +32,28 @@ def derived(rates, fractions):
 
 
 @torch.no_grad()
-def run_model(module, counts, batch_size=4096, n_samples=20, seed=0):
+def run_model(module, counts, batch_size=4096, n_samples=20, seed=0, device="auto"):
     """Per-pixel parameters from the posterior.
 
     With ``n_samples`` > 0 (the default, as in LUMOS's sample_posterior) each
     parameter is the median over that many posterior draws, its standard
     deviation over the draws is returned as ``<name>_std``, and the
     reconstruction is the mean over draws. With 0 the posterior mean of the
-    latent is decoded once.
+    latent is decoded once. Runs on ``device`` ("auto" for CUDA, then MPS,
+    then CPU); results come back as numpy on the host.
     """
     torch.manual_seed(seed)
-    model = module.model.eval()
+    device = pick_device(device)
+    model = module.model.to(device).eval()
     keys = ("tau", "fractions", "background", "alpha", "tau_int", "tau_amp")
     out = {k: [] for k in keys + ("chi2r",)}
     spread = {k: [] for k in keys}
     recon = []
     for start in range(0, len(counts), batch_size):
-        x = torch.as_tensor(counts[start:start + batch_size], dtype=torch.float32)
+        x = torch.as_tensor(counts[start:start + batch_size], dtype=torch.float32, device=device)
         draws = [model(x, sample=True) for _ in range(n_samples)] if n_samples else [model(x, sample=False)]
+        draws = [{k: v.cpu() for k, v in r.items() if v is not None} for r in draws]
+        x = x.cpu()
         vals = [dict(derived(r["rates"], r["fractions"]), fractions=r["fractions"],
                      background=r["background"]) for r in draws]
         for k in keys:
@@ -143,11 +148,13 @@ def main(argv=None):
     p.add_argument("--data", required=True)
     p.add_argument("--out", default="")
     p.add_argument("--n_samples", type=int, default=20)
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda or mps")
     a = p.parse_args(argv)
 
     module = FlimModule.load_from_checkpoint(a.checkpoint, map_location="cpu")
     ds, meta = open_store(a.data)
-    result = run_model(module, ds["counts"].values, n_samples=a.n_samples)
+    result = run_model(module, ds["counts"].values, n_samples=a.n_samples, device=a.device)
+    module.cpu()
     m = module.model
     print(f"IRF: t0={m.irf_t0.item():.3f} ns sigma={m.irf_sigma.item():.3f} ns")
     if m.bases is not None:

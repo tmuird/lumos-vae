@@ -86,6 +86,19 @@ python -m lumos_flim.train --data data/hmsc.zarr --irf calibration/irf_hmsc.json
 python -m lumos_flim.predict checkpoints/<run>/best.ckpt --data data/hmsc.zarr --out results/hmsc --n_samples 10
 ```
 
+Training runs on PyTorch Lightning and picks the hardware itself: CUDA if
+present, then Apple MPS, then CPU (`--accelerator auto`; pass `cuda`, `mps` or
+`cpu` to choose). On a GPU the whole pixel store is copied to the device once
+(`--preload`, on by default) and batches are gathered with a single indexing
+call. `predict.py` and `baseline.py` take `--device` in the same way. The
+normal CDF, its log and the scaled complementary error function are built
+from elementary operations (Numerical Recipes' erfc fit, relative error below
+1.2e-7), because MPS has no kernels for `torch.special.erfcx` or `log_ndtr`.
+`tests/test_physics.py::test_runs_on_device` checks the physics and a training
+step on every accelerator present against the CPU result. Calibration stays on
+the CPU in float64. The GPU paths were written for CUDA and MPS but only the
+CPU path has been run so far; run the tests on the target machine first.
+
 Synthetic data with ground truth is simulated photon by photon. The generator
 does not use the analytical model, so a fit is not the model agreeing with
 itself:

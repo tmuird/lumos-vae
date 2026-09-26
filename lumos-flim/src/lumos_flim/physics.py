@@ -37,7 +37,42 @@ Times are in ns and rates in 1/ns throughout.
 import math
 
 import torch
-from torch.special import log_ndtr, ndtr
+
+_LOG_HALF = math.log(0.5)
+_SQRT_HALF = math.sqrt(0.5)
+
+
+# The special functions are built from elementary operations so the model
+# runs unchanged on CPU, CUDA and Apple's MPS, which lacks kernels for
+# torch.special.erfcx and log_ndtr.
+
+def erfcx(x):
+    """Scaled complementary error function exp(x^2) erfc(x), for x >= 0.
+
+    Chebyshev fit from Numerical Recipes (erfcc), fractional error below
+    1.2e-7 everywhere, which is float32 precision. Negative inputs are
+    clamped to zero; callers only need the non-negative branch.
+    """
+    x = x.clamp(min=0.0)
+    t = 1.0 / (1.0 + 0.5 * x)
+    poly = -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (
+        -0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (
+            -0.82215223 + t * 0.17087277))))))))
+    return t * torch.exp(poly)
+
+
+def log_ndtr(x):
+    """log of the standard normal CDF, accurate far into both tails."""
+    z = x.abs() * _SQRT_HALF
+    log_tail = _LOG_HALF + torch.log(erfcx(z)) - z**2  # log Phi(-|x|)
+    return torch.where(x < 0, log_tail, torch.log1p(-torch.exp(log_tail)))
+
+
+def ndtr(x):
+    """Standard normal CDF."""
+    z = x.abs() * _SQRT_HALF
+    tail = 0.5 * erfcx(z) * torch.exp(-z**2)  # Phi(-|x|)
+    return torch.where(x < 0, tail, 1.0 - tail)
 
 
 def bin_edges(n_bins: int, bin_width: float, device=None, dtype=torch.float32):
@@ -61,7 +96,7 @@ def _exgauss_tail(t, rate, t0, sigma):
     ks = rate * sigma
     u = (t - t0) / sigma
     w = (ks - u) / math.sqrt(2.0)
-    scaled = 0.5 * torch.exp(-0.5 * u**2) * torch.special.erfcx(w.clamp(min=0.0))
+    scaled = 0.5 * torch.exp(-0.5 * u**2) * erfcx(w)
     u_c = torch.maximum(u, ks)
     direct = torch.exp(ks * (0.5 * ks - u_c) + log_ndtr(u_c - ks))
     return torch.where(w > 0, scaled, direct)

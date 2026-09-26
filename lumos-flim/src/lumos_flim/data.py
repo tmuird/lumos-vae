@@ -123,34 +123,53 @@ def irf_t0_guess(counts, bin_width: float) -> float:
 
 
 class PixelDataset(Dataset):
-    def __init__(self, counts, gt: Optional[dict] = None):
-        self.counts = torch.as_tensor(counts, dtype=torch.float32)
-        self.gt = {k: torch.as_tensor(v, dtype=torch.float32) for k, v in (gt or {}).items()}
+    """Pixel histograms, optionally held on the training device.
+
+    Batches are gathered with one indexing call (``__getitems__``) rather than
+    per pixel, which matters once the tensors live on a GPU.
+    """
+
+    def __init__(self, counts, gt: Optional[dict] = None, device=None):
+        self.counts = torch.as_tensor(counts, dtype=torch.float32, device=device)
+        self.gt = {k: torch.as_tensor(v, dtype=torch.float32, device=device)
+                   for k, v in (gt or {}).items()}
 
     def __len__(self):
         return len(self.counts)
 
     def __getitem__(self, i):
-        item = {"x": self.counts[i], "index": i}
+        return self.__getitems__([i])
+
+    def __getitems__(self, indices):
+        idx = torch.as_tensor(indices, device=self.counts.device)
+        batch = {"x": self.counts[idx], "index": idx}
         for k, v in self.gt.items():
-            item[k] = v[i]
-        return item
+            batch[k] = v[idx]
+        return batch
+
+
+def _identity(batch):
+    return batch
 
 
 class FlimDataModule(pl.LightningDataModule):
     """Loads the whole store into memory; pixel stores are small.
 
     Fitting is unsupervised, so by default the model fits on train and test
-    together (``transductive``) and is monitored on val, as in LUMOS.
+    together (``transductive``) and is monitored on val, as in LUMOS. With
+    ``preload_device`` the arrays are copied to that device once, so no batch
+    crosses from host memory during training.
     """
 
     def __init__(self, path, batch_size: int = 512, transductive: bool = True,
-                 num_workers: int = 0):
+                 num_workers: int = 0, preload_device=None):
         super().__init__()
         self.path = path
         self.batch_size = batch_size
         self.transductive = transductive
-        self.num_workers = num_workers
+        self.preload_device = preload_device
+        # Worker processes cannot share tensors that already sit on a GPU.
+        self.num_workers = 0 if preload_device is not None else num_workers
         self.train_ds = None
 
     def setup(self, stage=None):
@@ -166,17 +185,21 @@ class FlimDataModule(pl.LightningDataModule):
 
         fit = split != SPLITS["val"] if self.transductive else split == SPLITS["train"]
         val = split == SPLITS["val"]
-        self.train_ds = PixelDataset(counts[fit], {k: v[fit] for k, v in gt.items()})
-        self.val_ds = PixelDataset(counts[val], {k: v[val] for k, v in gt.items()})
+        dev = self.preload_device
+        self.train_ds = PixelDataset(counts[fit], {k: v[fit] for k, v in gt.items()}, dev)
+        self.val_ds = PixelDataset(counts[val], {k: v[val] for k, v in gt.items()}, dev)
         self.irf_t0_guess = irf_t0_guess(counts[fit], self.bin_width)
         print(f"FlimDataModule: {len(self.train_ds)} fit, {len(self.val_ds)} val pixels, "
               f"{self.n_channels} channel(s) x {self.n_bins} bins of {self.bin_width:.4f} ns, "
-              f"median {np.median(counts[fit].sum((1, 2))):.0f} photons/pixel")
+              f"median {np.median(counts[fit].sum((1, 2))):.0f} photons/pixel"
+              + (f", preloaded to {dev}" if dev is not None else ""))
+
+    def _loader(self, ds, batch_size, shuffle, drop_last):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+                          num_workers=self.num_workers, collate_fn=_identity)
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
-                          drop_last=True, num_workers=self.num_workers)
+        return self._loader(self.train_ds, self.batch_size, shuffle=True, drop_last=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=4 * self.batch_size, shuffle=False,
-                          num_workers=self.num_workers)
+        return self._loader(self.val_ds, 4 * self.batch_size, shuffle=False, drop_last=False)

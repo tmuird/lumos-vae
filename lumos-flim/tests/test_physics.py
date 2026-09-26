@@ -4,6 +4,9 @@ import torch
 
 from lumos_flim.physics import (
     amplitude_fractions,
+    erfcx,
+    log_ndtr,
+    ndtr,
     decay_histograms,
     expected_counts,
     irf_histogram,
@@ -88,3 +91,40 @@ def test_model_step(channels):
     loss.backward()
     assert torch.isfinite(module.model.irf_t0.grad)
 
+
+
+def test_special_functions_match_torch():
+    # Built from elementary ops so they run on MPS; checked against torch.special.
+    x = torch.linspace(-37, 37, 20001, dtype=torch.float64)
+    ref_log = torch.special.log_ndtr(x)
+    assert (log_ndtr(x) - ref_log).abs().max() < 2e-7
+    assert ((ndtr(x) - ref_log.exp()).abs() / ref_log.exp()).max() < 2e-7
+    xp = torch.linspace(0, 1e4, 20001, dtype=torch.float64)
+    assert ((erfcx(xp) - torch.special.erfcx(xp)).abs() / torch.special.erfcx(xp)).max() < 2e-7
+
+
+def _devices():
+    devs = ["cpu"]
+    if torch.cuda.is_available():
+        devs.append("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        devs.append("mps")
+    return devs
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_runs_on_device(device):
+    """Physics and a full training step on each available accelerator, matching CPU."""
+    rates = torch.logspace(-1, 2, 12)
+    ref = decay_histograms(rates, 1.0, 0.1, N_BINS, BIN)
+    got = decay_histograms(rates.to(device), 1.0, 0.1, N_BINS, BIN).cpu()
+    assert torch.allclose(got, ref, atol=1e-6)
+
+    torch.manual_seed(0)
+    module = FlimModule(n_bins=N_BINS, bin_width=BIN, latent_dim=4, hidden_dim=16,
+                        decoder_dim=16, conv_channels="8,8").to(device)
+    x = torch.poisson(torch.full((6, 1, N_BINS), 20.0)).to(device)
+    out = module.model(x, sample=False)
+    loss = poisson_half_deviance(x, out["expected"]).mean()
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(module.model.irf_t0.grad)

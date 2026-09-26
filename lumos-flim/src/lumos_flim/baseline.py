@@ -20,12 +20,13 @@ from lumos_flim.data import open_store
 from lumos_flim.physics import decay_histograms, expected_counts
 from lumos_flim.predict import derived, gt_report, summarise
 from lumos_flim.data import irf_t0_guess
+from lumos_flim.device import pick_device
 from lumos_flim.vae import _SIGMA_FLOOR, FlimVAE
 from lumos_flim.vae_module import FlimModule, n_free_parameters, pearson_chi2, poisson_half_deviance
 
 
 def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf=False,
-               global_lifetimes=False):
+               global_lifetimes=False, device="auto"):
     """Adam on every pixel at once. Pixels are independent, so the summed loss
     is separable and one optimiser is equivalent to one per pixel.
 
@@ -39,17 +40,18 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf
     """
     Fn = model.n_components
     C = counts.shape[1]
-    t0 = model.irf_t0.detach().clone().requires_grad_(fit_irf)
-    sigma_raw = model.irf_sigma_raw.detach().clone().requires_grad_(fit_irf)
+    device = pick_device(device)
+    t0 = model.irf_t0.detach().to(device).clone().requires_grad_(fit_irf)
+    sigma_raw = model.irf_sigma_raw.detach().to(device).clone().requires_grad_(fit_irf)
     if fit_irf or global_lifetimes:
         chunk = len(counts)
-    bases = model.bases.detach() if model.bases is not None else None
-    rate_bias = model.decoder.head_rate.bias.detach()
-    frac_bias = model.decoder.head_fraction.bias.detach()
+    bases = model.bases.detach().to(device) if model.bases is not None else None
+    rate_bias = model.decoder.head_rate.bias.detach().to(device)
+    frac_bias = model.decoder.head_fraction.bias.detach().to(device)
 
     results = []
     for start in range(0, len(counts), chunk):
-        x = torch.as_tensor(counts[start:start + chunk], dtype=torch.float32)
+        x = torch.as_tensor(counts[start:start + chunk], dtype=torch.float32, device=device)
         B = len(x)
         totals = x.sum((1, 2)).clamp(min=1.0)
         rate_raw = (rate_bias[None] if global_lifetimes else rate_bias.expand(B, Fn)).clone().requires_grad_()
@@ -57,7 +59,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf
         params = [rate_raw, frac_logits] + ([t0, sigma_raw] if fit_irf else [])
         bg_logits = None
         if C > 1:
-            bg_logits = torch.zeros(B, C, requires_grad=True)
+            bg_logits = torch.zeros(B, C, device=device, requires_grad=True)
             params.append(bg_logits)
         opt = torch.optim.Adam(params, lr=lr)
 
@@ -77,7 +79,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf
             opt.step()
         with torch.no_grad():
             rates, probs, mu = forward()
-            results.append((rates, probs, pearson_chi2(x, mu), mu))
+            results.append(tuple(v.cpu() for v in (rates, probs, pearson_chi2(x, mu), mu)))
 
     rates = torch.cat([r[0] for r in results])
     probs = torch.cat([r[1] for r in results])
@@ -131,6 +133,7 @@ def main(argv=None):
     p.add_argument("--global_lifetimes", action="store_true",
                    help="share the lifetimes across all pixels (global analysis)")
     p.add_argument("--steps", type=int, default=1500)
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda or mps")
     p.add_argument("--out", default="")
     a = p.parse_args(argv)
 
@@ -156,7 +159,7 @@ def main(argv=None):
         raise SystemExit("give --checkpoint, --irf or --fit_irf")
 
     result, expected = fit_pixels(counts, model, steps=a.steps, fit_irf=a.fit_irf,
-                                  global_lifetimes=a.global_lifetimes)
+                                  global_lifetimes=a.global_lifetimes, device=a.device)
     print(f"IRF: t0={result.pop('irf_t0'):.3f} ns sigma={result.pop('irf_sigma'):.3f} ns "
           f"({'fitted' if a.fit_irf else 'fixed'})")
     gt_report(result, ds)

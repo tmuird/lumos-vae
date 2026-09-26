@@ -9,6 +9,9 @@ out) and one with the lifetime free. If the free fit does not land near the
 known lifetime, or the reduced chi-square is far above one, the Gaussian IRF
 is a poor description of the instrument and the lifetimes fitted with it will
 be biased accordingly.
+
+Runs on the CPU in float64: it is one histogram, fitted in seconds, and MPS
+has no float64 support.
 """
 
 import argparse

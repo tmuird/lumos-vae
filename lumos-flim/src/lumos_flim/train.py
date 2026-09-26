@@ -20,6 +20,7 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 
 from lumos_flim.data import FlimDataModule
+from lumos_flim.device import pick_device
 from lumos_flim.vae_module import FlimModule
 
 DEFAULTS = dict(
@@ -48,6 +49,10 @@ DEFAULTS = dict(
     val_check_steps=0,  # validate about every N optimiser steps, 0 for every epoch
     gradient_clip_val=1.0,
     transductive=True,
+    # Hardware. "auto" picks CUDA, then Apple MPS, then CPU. With preload the
+    # whole store is copied to the GPU once instead of batch by batch.
+    accelerator="auto",
+    preload=True,
     seed=0,
     run_name="",
     resume="",  # existing run directory to continue from its last.ckpt
@@ -72,7 +77,11 @@ def make_run_name(cfg) -> str:
 def train(cfg):
     pl.seed_everything(cfg["seed"], workers=True)
     torch.set_float32_matmul_precision("medium")
-    dm = FlimDataModule(cfg["data"], batch_size=cfg["batch_size"], transductive=cfg["transductive"])
+    device = pick_device(cfg["accelerator"])
+    preload = device if cfg["preload"] and device.type != "cpu" else None
+    print(f"training on {device}")
+    dm = FlimDataModule(cfg["data"], batch_size=cfg["batch_size"], transductive=cfg["transductive"],
+                        preload_device=preload)
     dm.setup()
 
     irf_t0, irf_sigma = dm.irf_t0_guess, 0.1
@@ -130,6 +139,8 @@ def train(cfg):
         logger = WandbLogger(project="LUMOS-FLIM", name=run_name, log_model=False)
 
     trainer = pl.Trainer(
+        accelerator=device.type,
+        devices=1,
         max_epochs=cfg["max_epochs"],
         check_val_every_n_epoch=val_every,
         logger=logger,
