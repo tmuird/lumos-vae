@@ -88,16 +88,3 @@ def test_model_step(channels):
     loss.backward()
     assert torch.isfinite(module.model.irf_t0.grad)
 
-
-def test_lumos_port_step():
-    from lumos_flim.lumos.vae_module import VAEModule
-
-    module = VAEModule(n_wavenumbers=1, n_times_train=N_BINS, n_full_timepoints=N_BINS,
-                       time_values=torch.arange(N_BINS) * BIN, frame_duration=BIN,
-                       latent_dim=4, hidden_dim=16, decoder_dim=16)
-    x = torch.poisson(torch.full((6, 1, N_BINS), 20.0))
-    recon, mu, logvar, lambdas, abundances, static, bases = module.model(x)
-    assert recon.shape == x.shape
-    assert torch.isfinite(recon).all()
-    recon.sum().backward()
-    assert torch.isfinite(module.model.irf_t0.grad)

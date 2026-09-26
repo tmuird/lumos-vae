@@ -1,9 +1,9 @@
-"""Low-photon sweep: VAE, LUMOS port and direct per-pixel MLE against ground truth.
+"""Low-photon sweep: the VAE against the direct per-pixel MLE, with ground truth.
 
     python scripts/photon_sweep.py --photons 50 100 200 500 1000 --out results/sweep
 
 For each photon budget the same synthetic maps are simulated photon by photon,
-each method is fitted, and the held-out val pixels (never seen by either VAE)
+each method is fitted, and the held-out val pixels (never seen by the VAE)
 are scored on
   - lifetime and amplitude-fraction errors,
   - amplitude-weighted mean lifetime error, the quantity usually reported
@@ -24,8 +24,6 @@ import torch
 
 from lumos_flim.baseline import fit_pixels
 from lumos_flim.data import SPLITS, irf_t0_guess, open_store
-from lumos_flim.lumos.predict import run as run_lumos
-from lumos_flim.lumos.vae_module import VAEModule
 from lumos_flim.physics import decay_histograms, expected_counts
 from lumos_flim.predict import derived, run_model
 from lumos_flim.vae import FlimVAE
@@ -50,13 +48,6 @@ def truth(ds, meta):
 def recon_flimvae(module, counts):
     return module.model(torch.as_tensor(counts, dtype=torch.float32), sample=False)["expected"].numpy()
 
-
-@torch.no_grad()
-def recon_lumos(module, counts):
-    m = module.model.eval()
-    x = torch.as_tensor(counts, dtype=torch.float32) / (module.hparams.dataset_std + 1e-8)
-    _, _, _, rates, abund, static, bases = m(x, sample=False)
-    return m.physics_forward(rates, abund, static, bases, time_values=module.t_full)[0].numpy()
 
 
 def score(name, res, recon, ds, mu_true, held):
@@ -107,12 +98,6 @@ def main():
         rows.append(dict(photons=n, **score("VAE", run_model(vae, counts),
                                             recon_flimvae(vae, counts), ds, mu_true, held)))
 
-        sh(["lumos_flim.lumos.train", "--data", store, "--max_epochs", str(a.epochs),
-            "--run_name", f"sweep_{tag}_lumos"])
-        lum = VAEModule.load_from_checkpoint(f"checkpoints/sweep_{tag}_lumos/last.ckpt", map_location="cpu")
-        rows.append(dict(photons=n, **score("LUMOS port", run_lumos(lum, counts, lum.hparams.dataset_std),
-                                            recon_lumos(lum, counts), ds, mu_true, held)))
-
         init = FlimVAE(n_bins=counts.shape[2], bin_width=meta["bin_width_ns"],
                        irf_t0=irf_t0_guess(counts, meta["bin_width_ns"]), irf_sigma=0.1)
         res, rec = fit_pixels(counts, init, fit_irf=True)
@@ -121,7 +106,7 @@ def main():
 
         with open(f"{a.out}/sweep.json", "w") as f:
             json.dump(rows, f, indent=1)
-        for r in rows[-4:]:
+        for r in rows[-3:]:
             print(json.dumps(r), flush=True)
 
 
