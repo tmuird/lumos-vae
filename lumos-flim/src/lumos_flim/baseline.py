@@ -19,16 +19,25 @@ from torch.nn import functional as F
 from lumos_flim.data import open_store
 from lumos_flim.physics import decay_histograms, expected_counts
 from lumos_flim.predict import derived, gt_report, summarise
-from lumos_flim.vae import FlimVAE
+from lumos_flim.data import irf_t0_guess
+from lumos_flim.vae import _SIGMA_FLOOR, FlimVAE
 from lumos_flim.vae_module import FlimModule, n_free_parameters, pearson_chi2, poisson_half_deviance
 
 
-def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000):
+def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000, fit_irf=False):
     """Adam on every pixel at once. Pixels are independent, so the summed loss
-    is separable and one optimiser is equivalent to one per pixel."""
+    is separable and one optimiser is equivalent to one per pixel.
+
+    With ``fit_irf`` the IRF centre and width are fitted as well, shared by
+    every pixel, so all pixels go in one chunk. No network is involved: this
+    is the direct, non-amortised fit of the physics model to the data.
+    """
     Fn = model.n_components
     C = counts.shape[1]
-    t0, sigma = model.irf_t0.detach(), model.irf_sigma.detach()
+    t0 = model.irf_t0.detach().clone().requires_grad_(fit_irf)
+    sigma_raw = model.irf_sigma_raw.detach().clone().requires_grad_(fit_irf)
+    if fit_irf:
+        chunk = len(counts)
     bases = model.bases.detach() if model.bases is not None else None
     rate_bias = model.decoder.head_rate.bias.detach()
     frac_bias = model.decoder.head_fraction.bias.detach()
@@ -40,7 +49,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000):
         totals = x.sum((1, 2)).clamp(min=1.0)
         rate_raw = rate_bias.expand(B, Fn).clone().requires_grad_()
         frac_logits = frac_bias.expand(B, Fn + 1).clone().requires_grad_()
-        params = [rate_raw, frac_logits]
+        params = [rate_raw, frac_logits] + ([t0, sigma_raw] if fit_irf else [])
         bg_logits = None
         if C > 1:
             bg_logits = torch.zeros(B, C, requires_grad=True)
@@ -51,6 +60,7 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000):
             rates = model.rate_min + torch.cumsum(F.softplus(rate_raw), -1)
             probs = F.softmax(frac_logits, -1)
             bg_spec = F.softmax(bg_logits, -1) if bg_logits is not None else None
+            sigma = F.softplus(sigma_raw) + _SIGMA_FLOOR
             decays = decay_histograms(rates, t0, sigma, model.n_bins, model.bin_width)
             mu = expected_counts(totals, probs[:, :-1], probs[:, -1], decays, bases, bg_spec)
             return rates, probs, mu
@@ -62,15 +72,45 @@ def fit_pixels(counts, model: FlimVAE, steps=1500, lr=0.05, chunk=20000):
             opt.step()
         with torch.no_grad():
             rates, probs, mu = forward()
-            results.append((rates, probs, pearson_chi2(x, mu)))
+            results.append((rates, probs, pearson_chi2(x, mu), mu))
 
     rates = torch.cat([r[0] for r in results])
     probs = torch.cat([r[1] for r in results])
     chi2 = torch.cat([r[2] for r in results])
+    expected = torch.cat([r[3] for r in results])
     out = {k: v.numpy() for k, v in derived(rates, probs[:, :-1]).items()}
     out.update(fractions=probs[:, :-1].numpy(), background=probs[:, -1].numpy(),
                chi2r=(chi2 / (C * model.n_bins - n_free_parameters(Fn, C))).numpy())
-    return out
+    out["irf_t0"] = t0.item()
+    out["irf_sigma"] = (F.softplus(sigma_raw) + _SIGMA_FLOOR).item()
+    return out, expected.numpy()
+
+
+def plot_fits(counts, expected, bin_width, path, n=4, seed=0):
+    """Data, model and normalised residuals for a few random pixels."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    idx = np.random.default_rng(seed).choice(len(counts), n, replace=False)
+    t = (np.arange(counts.shape[-1]) + 0.5) * bin_width
+    fig, axes = plt.subplots(2, n, figsize=(3.4 * n, 4.6), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1]})
+    for j, i in enumerate(idx):
+        h, mu = counts[i].sum(0), expected[i].sum(0)
+        axes[0, j].semilogy(t, np.maximum(h, 0.5), ".", color="0.3", label="data")
+        axes[0, j].semilogy(t, mu, "-", color="C0", label="fit")
+        axes[0, j].set_title(f"pixel {i}, {h.sum():.0f} photons", fontsize=9)
+        axes[1, j].bar(t, (h - mu) / np.sqrt(np.maximum(mu, 1e-9)), width=bin_width, color="C1")
+        axes[1, j].axhline(0, color="0.5", lw=0.8)
+        axes[1, j].set_xlabel("delay (ns)")
+    axes[0, 0].legend(fontsize=8)
+    axes[0, 0].set_ylabel("counts")
+    axes[1, 0].set_ylabel("residual (sigma)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
 
 
 def main(argv=None):
@@ -80,6 +120,9 @@ def main(argv=None):
     p.add_argument("--irf", default="", help="or from a calibration JSON (single channel only)")
     p.add_argument("--irf_fit", default="fixed", choices=["fixed", "free"])
     p.add_argument("--n_components", type=int, default=2)
+    p.add_argument("--fit_irf", action="store_true",
+                   help="fit the IRF jointly with the pixels; with neither --checkpoint nor "
+                        "--irf it starts from the rising edge of the data")
     p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--out", default="")
     a = p.parse_args(argv)
@@ -96,16 +139,25 @@ def main(argv=None):
                         irf_t0=cal["irf_t0"], irf_sigma=cal["irf_sigma"])
         if counts.shape[1] > 1:
             raise SystemExit("multichannel data needs --checkpoint for the component spectra")
+    elif a.fit_irf:
+        if counts.shape[1] > 1:
+            raise SystemExit("multichannel data needs --checkpoint for the component spectra")
+        model = FlimVAE(n_bins=counts.shape[2], bin_width=meta["bin_width_ns"],
+                        n_components=a.n_components,
+                        irf_t0=irf_t0_guess(counts, meta["bin_width_ns"]), irf_sigma=0.1)
     else:
-        raise SystemExit("give --checkpoint or --irf")
+        raise SystemExit("give --checkpoint, --irf or --fit_irf")
 
-    result = fit_pixels(counts, model, steps=a.steps)
+    result, expected = fit_pixels(counts, model, steps=a.steps, fit_irf=a.fit_irf)
+    print(f"IRF: t0={result.pop('irf_t0'):.3f} ns sigma={result.pop('irf_sigma'):.3f} ns "
+          f"({'fitted' if a.fit_irf else 'fixed'})")
     gt_report(result, ds)
     summarise(result, ds, meta, a.out or None)
     if a.out:
         np.savez_compressed(f"{a.out}.npz", image=ds["image"].values, y=ds["y"].values,
                             x=ds["x"].values, split=ds["split"].values, **result)
-        print(f"wrote {a.out}.npz")
+        plot_fits(counts, expected, meta["bin_width_ns"], f"{a.out}_fits.png")
+        print(f"wrote {a.out}.npz and {a.out}_fits.png")
 
 
 if __name__ == "__main__":

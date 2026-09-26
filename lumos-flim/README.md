@@ -109,6 +109,26 @@ simulations (reduced chi-square about 1) for lifetimes from 1 ps to 30 ns,
 including an IRF that straddles the end of the window. See
 `tests/test_physics.py`.
 
+**Direct fit, no network.** Before any amortisation, `baseline.py --fit_irf`
+fits the physics model straight to the data. Per-pixel lifetimes and fractions
+and one shared IRF are optimised jointly by maximum likelihood, starting from
+the rising edge of the data:
+
+```bash
+python -m lumos_flim.baseline --data data/hmsc.zarr --fit_irf --out results/hmsc_direct
+```
+
+On synthetic data this recovers the IRF from scratch (t0 = 1.006 ns and
+σ = 0.122 ns, against the true 1.0 and 0.12), with reduced chi-square 0.97.
+On hMSC it reaches reduced chi-square 0.99, and its IRF (0.427 / 0.109 ns)
+agrees with the one the VAE learned (0.423 / 0.107 ns). The residuals show no
+structure, so the forward model alone describes the data before any network
+is involved. Its lifetimes are in the hMSC table below as "MLE". Random pixels,
+data against fit, with normalised residuals:
+
+![direct fits, synthetic](docs/synthetic_direct_fits.png)
+![direct fits, hMSC](docs/hmsc_direct_fits.png)
+
 **Synthetic, 96x96, ~1000 photons/pixel, bi-exponential (τ 2-3.5 ns and
 0.3-0.6 ns) plus background.** These are held-out pixels. The relative
 lifetime errors are signed median / interquartile range, and α is the
@@ -142,14 +162,14 @@ refine the IRF.
 | | τ bound (ns) | τ free (ns) | α free | amplitude-weighted τ (ns) | reduced χ² |
 |---|---|---|---|---|---|
 | control, VAE | 3.42 | 0.51 | 0.79 | 1.10 | 1.04 |
-| control, MLE | 3.16 | 0.49 | 0.79 | 1.10 | 0.99 |
+| control, MLE | 3.12 | 0.48 | 0.79 | 1.08 | 0.99 |
 | rotenone, VAE | 3.08 | 0.48 | 0.81 | 0.96 | 1.04 |
-| rotenone, MLE | 2.84 | 0.44 | 0.82 | 0.91 | 0.99 |
+| rotenone, MLE | 2.80 | 0.43 | 0.82 | 0.89 | 0.99 |
 
 The lifetimes sit in the usual NADH ranges (free about 0.4 ns, bound 2-3.4
 ns). Rotenone shortens the mean lifetime and raises the free fraction. The raw
 phasor shows the same shift with no model at all: phase 43.3° to 40.4°,
-modulation 0.58 to 0.61. The VAE's bound lifetime is about 8% above MLE's,
+modulation 0.58 to 0.61. The VAE's bound lifetime is about 10% above MLE's,
 consistent with the synthetic bias at `kl_weight=1`.
 
 ![hMSC control](docs/hmsc_control.png)
